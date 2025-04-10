@@ -36,6 +36,20 @@ def save_user(chat_id):
     except Exception as e:
         logger.error(f"Ошибка сохранения пользователя: {e}")
 
+async def start_command(update: Update, context):
+    await update.message.reply_text(
+        "Привет, я Загружатель! 🎬\n\n"
+        "Отправь мне ссылку на Reels из Instagram — и я постараюсь прислать тебе видео в ответ.\n\n"
+        "Я умею загружать видео из:\n"
+        "📌 Instagram\n"
+        "📌 YouTube\n"
+        "📌 TikTok\n"
+        "📌 VK Clips\n\n"
+        "А ещё — могу найти и прислать музыку, если ты отправишь мне название в формате:\n"
+        "`Артист - Трек`",
+        parse_mode='Markdown'
+    )
+
 async def get_users_count(update: Update, context):
     """Команда /users: показывает количество пользователей (только для ADMIN_ID)."""
     if update.message.chat_id != ADMIN_ID:
@@ -176,6 +190,7 @@ def main():
     # Добавляем обработчики
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CommandHandler("users", get_users_count))
+    application.add_handler(CommandHandler("start", start_command))
 
     # Запускаем бота
     application.run_polling()
