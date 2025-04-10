@@ -1,5 +1,3 @@
-//Функционал аналогичен botMain, но с ограничением на загрузку файла тяжелее 48мб и логированием кол-ва пользователей
-
 import os
 import re
 import logging
@@ -7,6 +5,9 @@ import glob
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
 from yt_dlp import YoutubeDL
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(
@@ -16,7 +17,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ID администратора
-ADMIN_ID = 181571530
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 # Файл для хранения пользователей
 USERS_FILE = "users.txt"
@@ -76,7 +77,7 @@ def download_video(url: str) -> str:
     # Проверка размера видео
     max_size_mb = 48  # Лимит размера файла (MB)
     file_size_bytes = info_dict.get('filesize') or info_dict.get('filesize_approx')
-    
+
     if file_size_bytes:
         file_size_mb = file_size_bytes / (1024 * 1024)
         if file_size_mb > max_size_mb:
@@ -120,7 +121,7 @@ def download_music(query: str) -> str:
             info_dict = ydl.extract_info(f"ytsearch:{query}", download=True)
             if not info_dict.get('entries'):
                 raise Exception("Ничего не найдено.")
-            
+
             audio_filename = ydl.prepare_filename(info_dict['entries'][0]).replace(".webm", ".mp3").replace(".m4a", ".mp3")
             return audio_filename
         except Exception as e:
@@ -169,7 +170,7 @@ async def handle_message(update: Update, context):
 
 
 def main():
-    token = "7928789298:AAHX5IZMHzrAClcqQQ7deEz2OoyzVmPzdvw"
+    token = os.getenv("TOKEN")
     application = ApplicationBuilder().token(token).build()
 
     # Добавляем обработчики
