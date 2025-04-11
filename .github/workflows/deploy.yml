@@ -13,7 +13,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Connect & Deploy via SSH
+      - name: Deploy to server via SSH
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -26,3 +26,19 @@ jobs:
             docker stop tg-bot || true
             docker rm tg-bot || true
             docker run --env-file .env --restart unless-stopped -d --name tg-bot telegram-bot
+
+      - name: Send success notification to Telegram
+        if: success()
+        run: |
+          curl -s -X POST https://api.telegram.org/bot${{ secrets.NOTIFY_TOKEN }}/sendMessage \
+            -d chat_id=${{ secrets.NOTIFY_CHAT_ID }} \
+            -d parse_mode=Markdown \
+            -d text="✅ *Deploy успешен!* Бот обновлён и запущен на сервере. \n\n🕒 Время: $(date '+%Y-%m-%d %H:%M') \n🔁 Коммит: \`${{ github.sha }}\`"
+
+      - name: Send failure notification to Telegram
+        if: failure()
+        run: |
+          curl -s -X POST https://api.telegram.org/bot${{ secrets.NOTIFY_TOKEN }}/sendMessage \
+            -d chat_id=${{ secrets.NOTIFY_CHAT_ID }} \
+            -d parse_mode=Markdown \
+            -d text="❌ *Ошибка при деплое!* \n\n🕒 Время: $(date '+%Y-%m-%d %H:%M')"
