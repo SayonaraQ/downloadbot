@@ -30,22 +30,15 @@ jobs:
       - name: Send success notification to Telegram
         if: success()
         run: |
-          MESSAGE="✅ *Deploy успешен!* Бот обновлён и запущен на сервере.
-
-🕒 Время: $(date '+%Y-%m-%d %H:%M')
-🔁 Коммит: \`${{ github.sha }}\`"
           curl -s -X POST https://api.telegram.org/bot${{ secrets.NOTIFY_TOKEN }}/sendMessage \
             -d chat_id=${{ secrets.NOTIFY_CHAT_ID }} \
             -d parse_mode=Markdown \
-            --data-urlencode "text=$MESSAGE"
+            -d text="✅ *Deploy успешен!* Бот обновлён и запущен на сервере. 🕒 Время: $(date '+%Y-%m-%d %H:%M')"
 
       - name: Send failure notification to Telegram
         if: failure()
         run: |
-          MESSAGE="❌ *Ошибка при деплое!*
-
-🕒 Время: $(date '+%Y-%m-%d %H:%M')"
           curl -s -X POST https://api.telegram.org/bot${{ secrets.NOTIFY_TOKEN }}/sendMessage \
             -d chat_id=${{ secrets.NOTIFY_CHAT_ID }} \
             -d parse_mode=Markdown \
-            --data-urlencode "text=$MESSAGE"
+            -d text="❌ *Ошибка при деплое!* 🕒 Время: $(date '+%Y-%m-%d %H:%M')"
