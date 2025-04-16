@@ -46,18 +46,14 @@ jobs:
               docker run --env-file .env --restart unless-stopped -d --name tg-bot telegram-bot
             fi
 
-      - name: Send Telegram Notification
+      - name: Send Telegram Notification (success)
         if: success()
         run: |
-          curl -s -X POST https://api.telegram.org/bot${{ secrets.NOTIFY_TOKEN }}/sendMessage \
-            -d chat_id=${{ secrets.NOTIFY_CHAT_ID }} \
-            -d text="✅ Деплой для ветки *${{ github.ref_name }}* завершён."
-            -d parse_mode=Markdown
+          MESSAGE="✅ Деплой для ветки \`${{ github.ref_name }}\` завершён."
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.NOTIFY_TOKEN }}/sendMessage" -d chat_id=${{ secrets.NOTIFY_CHAT_ID }} -d parse_mode=Markdown --data-urlencode "text=$MESSAGE"
 
-      - name: Send failure notification to Telegram
+      - name: Send Telegram Notification (failure)
         if: failure()
         run: |
-          curl -s -X POST https://api.telegram.org/bot${{ secrets.NOTIFY_TOKEN }}/sendMessage \
-            -d chat_id=${{ secrets.NOTIFY_CHAT_ID }} \
-            -d text="❌ *Ошибка при деплое* в ветку *${{ github.ref_name }}*."
-            -d parse_mode=Markdown
+          MESSAGE="❌ Ошибка при деплое в ветку \`${{ github.ref_name }}\`"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.NOTIFY_TOKEN }}/sendMessage" -d chat_id=${{ secrets.NOTIFY_CHAT_ID }} -d parse_mode=Markdown --data-urlencode "text=$MESSAGE"
