@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import glob
+from asyncio import Semaphore
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
 from yt_dlp import YoutubeDL
@@ -20,7 +21,10 @@ logger = logging.getLogger(__name__)
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 # Файл для хранения пользователей
-USERS_FILE = "users.txt"
+USERS_FILE = "data/users.txt"
+
+# Ограничение на количество одновременных загрузок
+sema = Semaphore(5)
 
 def save_user(chat_id):
     """Сохраняет chat_id пользователя в файл, если его ещё нет."""
@@ -160,29 +164,29 @@ async def handle_message(update: Update, context):
 
     music_pattern = re.compile(r'^(\w{2,}(\s+\w{2,}){0,3})\s+-\s+(\w{2,}(\s+\w{2,}){0,3})$')
 
-    if (instagram_pattern.match(text) or tiktok_pattern.match(text) or
-        youtube_pattern.match(text) or vk_pattern.match(text)):
-        try:
-            video_filename = download_video(text)
-            with open(video_filename, 'rb') as video_file:
-                await update.message.reply_video(video=video_file)
-            os.remove(video_filename)
-        except ValueError as e:
-            await update.message.reply_text(str(e))
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
-            await update.message.reply_text("Не удалось загрузить видео.")
+    async with sema:
+        if (instagram_pattern.match(text) or tiktok_pattern.match(text) or
+            youtube_pattern.match(text) or vk_pattern.match(text)):
+            try:
+                video_filename = download_video(text)
+                with open(video_filename, 'rb') as video_file:
+                    await update.message.reply_video(video=video_file)
+                os.remove(video_filename)
+            except ValueError as e:
+                await update.message.reply_text(str(e))
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                await update.message.reply_text("Не удалось загрузить видео.")
 
-    elif music_pattern.match(text):
-        try:
-            audio_filename = download_music(text)
-            with open(audio_filename, 'rb') as audio_file:
-                await update.message.reply_audio(audio=audio_file, title=text)
-            os.remove(audio_filename)
-        except Exception as e:
-            logger.error(f"Ошибка: {e}")
-            await update.message.reply_text("Не удалось загрузить музыку.")
-
+        elif music_pattern.match(text):
+            try:
+                audio_filename = download_music(text)
+                with open(audio_filename, 'rb') as audio_file:
+                    await update.message.reply_audio(audio=audio_file, title=text)
+                os.remove(audio_filename)
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                await update.message.reply_text("Не удалось загрузить музыку.")
 
 def main():
     token = os.getenv("TOKEN")

@@ -43,7 +43,7 @@ jobs:
               docker build -t telegram-bot .
               docker stop tg-bot || true
               docker rm tg-bot || true
-              docker run --env-file .env --restart unless-stopped -d --name tg-bot telegram-bot
+              docker run --env-file .env -v /home/downloadbotdeploy/data:/app/data --restart unless-stopped -d --name tg-bot telegram-bot
             fi
 
       - name: Send Telegram Notification (success)
