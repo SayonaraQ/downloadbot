@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 # Файл для хранения пользователей
-USERS_FILE = "users.txt"
+USERS_FILE = "data/users.txt"
 
 # Ограничение на количество одновременных загрузок
 sema = Semaphore(5)
