@@ -2,7 +2,9 @@ name: CI/CD Deploy to VPS
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - stage
 
 jobs:
   deploy:
@@ -21,24 +23,41 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             cd /home/downloadbotdeploy/downloadbot
-            git pull origin main
-            docker build -t telegram-bot .
-            docker stop tg-bot || true
-            docker rm tg-bot || true
-            docker run --env-file .env --restart unless-stopped -d --name tg-bot telegram-bot
 
-      - name: Send success notification to Telegram
+            echo "Обновляем репозиторий на ветке ${{ github.ref_name }}"
+            git fetch origin
+            git checkout ${{ github.ref_name }}
+            git reset --hard origin/${{ github.ref_name }}
+
+            if [ "${{ github.ref_name }}" = "stage" ]; then
+              echo "🚧 Test(staging) deploy"
+              docker build -t telegram-bot-stage .
+              docker stop tg-bot-stage || true
+              docker rm tg-bot-stage || true
+              docker run --env-file stage.env --restart unless-stopped -d --name tg-bot-stage telegram-bot-stage
+
+            elif [ "${{ github.ref_name }}" = "main" ]; then
+              echo "🚀 Prod deploy"
+              docker stop tg-bot-stage || true
+              docker rm tg-bot-stage || true
+              docker build -t telegram-bot .
+              docker stop tg-bot || true
+              docker rm tg-bot || true
+              docker run --env-file .env --restart unless-stopped -d --name tg-bot telegram-bot
+            fi
+
+      - name: Send Telegram Notification
         if: success()
         run: |
           curl -s -X POST https://api.telegram.org/bot${{ secrets.NOTIFY_TOKEN }}/sendMessage \
             -d chat_id=${{ secrets.NOTIFY_CHAT_ID }} \
-            -d parse_mode=Markdown \
-            -d text="✅ *Deploy успешен!* Бот обновлён и запущен на сервере. 🕒 Время: $(date '+%Y-%m-%d %H:%M')"
+            -d text="✅ Деплой для ветки *${{ github.ref_name }}* завершён."
+            -d parse_mode=Markdown
 
       - name: Send failure notification to Telegram
         if: failure()
         run: |
           curl -s -X POST https://api.telegram.org/bot${{ secrets.NOTIFY_TOKEN }}/sendMessage \
             -d chat_id=${{ secrets.NOTIFY_CHAT_ID }} \
-            -d parse_mode=Markdown \
-            -d text="❌ *Ошибка при деплое!* 🕒 Время: $(date '+%Y-%m-%d %H:%M')"
+            -d text="❌ *Ошибка при деплое* в ветку *${{ github.ref_name }}*."
+            -d parse_mode=Markdown

@@ -1,4 +1,5 @@
 .env
+stage.env
 .idea/
 *.pyc
 bot.log
