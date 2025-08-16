@@ -22,6 +22,7 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
+            set -e
             cd /home/downloadbotdeploy/downloadbot
 
             echo "Обновляем репозиторий на ветке ${{ github.ref_name }}"
@@ -29,21 +30,32 @@ jobs:
             git checkout ${{ github.ref_name }}
             git reset --hard origin/${{ github.ref_name }}
 
+            # гарантируем, что каталоги для volume существуют
+            mkdir -p /home/downloadbotdeploy/data /home/downloadbotdeploy/cookies
+
             if [ "${{ github.ref_name }}" = "stage" ]; then
               echo "🚧 Test(staging) deploy"
               docker build -t telegram-bot-stage .
               docker stop tg-bot-stage || true
               docker rm tg-bot-stage || true
-              docker run --env-file stage.env --restart unless-stopped -d --name tg-bot-stage telegram-bot-stage
+              docker run -d --name tg-bot-stage \
+                --env-file stage.env \
+                -v /home/downloadbotdeploy/data:/app/data \
+                -v /home/downloadbotdeploy/cookies:/app/cookies \
+                --restart unless-stopped \
+                telegram-bot-stage
 
             elif [ "${{ github.ref_name }}" = "main" ]; then
               echo "🚀 Prod deploy"
-              docker stop tg-bot-stage || true
-              docker rm tg-bot-stage || true
               docker build -t telegram-bot .
               docker stop tg-bot || true
               docker rm tg-bot || true
-              docker run --env-file .env -v /home/downloadbotdeploy/data:/app/data --restart unless-stopped -d --name tg-bot telegram-bot
+              docker run -d --name tg-bot \
+                --env-file .env \
+                -v /home/downloadbotdeploy/data:/app/data \
+                -v /home/downloadbotdeploy/cookies:/app/cookies \
+                --restart unless-stopped \
+                telegram-bot
             fi
 
       - name: Send Telegram Notification (success)

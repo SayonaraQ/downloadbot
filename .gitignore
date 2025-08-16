@@ -4,3 +4,6 @@ stage.env
 *.pyc
 bot.log
 __pycache__/
+*.bak
+cookies/
+*.txt
