@@ -16,7 +16,6 @@ load_dotenv()
 
 RU_PROXY = os.getenv("RU_PROXY")
 YA_COOKIES_FILE = os.getenv("YA_COOKIES_FILE")
-VK_COOKIES_FILE = os.getenv("VK_COOKIES_FILE")
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -175,87 +174,87 @@ def download_music(query: str) -> str:
             raise
 
 YANDEX_URL_RE = re.compile(r'https?://(?:(?:www|m)\.)?music\.yandex\.(?:ru|by|kz|ua)/', re.I)
-VK_AUDIO_URL_RE = re.compile(r'https?://(?:(?:www|m)\.)?vk\.com/(?:audio|music)', re.I)
 
-def _resolve_yandex_album_track_url(url: str, proxy: str | None, cookiefile: str | None) -> str:
-    """
-    /track/<id> → /album/<album_id>/track/<id> по og:url/canonical.
-    Если не выйдет, вернём исходный url.
-    """
-    try:
-        if "/album/" in url and "/track/" in url:
-            return url
-        if not re.search(r"/track/\d+", url):
-            return url
-
-        session = requests.Session()
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.yandex.ru/"}
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-
-        if cookiefile and os.path.exists(cookiefile):
-            cj = cookiejar.MozillaCookieJar()
-            cj.load(cookiefile, ignore_expires=True, ignore_discard=True)
-            session.cookies = cj
-
-        html = session.get(url, headers=headers, proxies=proxies, timeout=15).text
-
-        # og:url
-        m = re.search(
-            r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
-            html, re.I)
-        if m:
-            return m.group(1)
-
-        # canonical
-        m = re.search(
-            r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
-            html, re.I)
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return url
+# def _resolve_yandex_album_track_url(url: str, proxy: str | None, cookiefile: str | None) -> str:
+#     """
+#     /track/<id> → /album/<album_id>/track/<id> по og:url/canonical.
+#     Если не выйдет, вернём исходный url.
+#     """
+#     try:
+#         if "/album/" in url and "/track/" in url:
+#             return url
+#         if not re.search(r"/track/\d+", url):
+#             return url
+#
+#         session = requests.Session()
+#         headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.yandex.ru/"}
+#         proxies = {"http": proxy, "https": proxy} if proxy else None
+#
+#         if cookiefile and os.path.exists(cookiefile):
+#             cj = cookiejar.MozillaCookieJar()
+#             cj.load(cookiefile, ignore_expires=True, ignore_discard=True)
+#             session.cookies = cj
+#
+#         html = session.get(url, headers=headers, proxies=proxies, timeout=15).text
+#
+#         # og:url
+#         m = re.search(
+#             r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
+#             html, re.I)
+#         if m:
+#             return m.group(1)
+#
+#         # canonical
+#         m = re.search(
+#             r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
+#             html, re.I)
+#         if m:
+#             return m.group(1)
+#     except Exception:
+#         pass
+#     return url
 
 def download_audio_by_url(url: str) -> str:
-    import re
-    import http.cookiejar as cookiejar
-    import requests
 
     is_yandex = bool(YANDEX_URL_RE.search(url))
-    is_vk_audio = bool(VK_AUDIO_URL_RE.search(url))
 
     cookiefile = None
     proxy = None
 
     if is_yandex:
         cookiefile = YA_COOKIES_FILE
-        proxy = RU_PROXY  # для ЯМузыки ходим через RU-прокси
-    elif is_vk_audio:
-        cookiefile = VK_COOKIES_FILE or None
-        proxy = RU_PROXY  # при желании тоже через RU
+        proxy = RU_PROXY
 
-    # ---- Нормализуем ссылку ЯМузыки /track/<id> -> /album/<album_id>/track/<id> ----
+    # ---- Нормализация: /track/<id> -> /album/<album_id>/track/<id> ----
     if is_yandex and "/track/" in url and "/album/" not in url:
         try:
             sess = requests.Session()
-            headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.yandex.ru/"}
+            headers = {
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://music.yandex.ru/",
+            }
             proxies = {"http": proxy, "https": proxy} if proxy else None
+
             if cookiefile and os.path.exists(cookiefile):
                 cj = cookiejar.MozillaCookieJar()
                 cj.load(cookiefile, ignore_expires=True, ignore_discard=True)
                 sess.cookies = cj
+
             html = sess.get(url, headers=headers, proxies=proxies, timeout=15).text
+
             # og:url
             m = re.search(
                 r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
-                html, re.I)
+                html, re.I
+            )
             if m:
                 url = m.group(1)
             else:
                 # canonical
                 m = re.search(
                     r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
-                    html, re.I)
+                    html, re.I
+                )
                 if m:
                     url = m.group(1)
         except Exception:
@@ -328,7 +327,7 @@ async def handle_message(update: Update, context):
     music_pattern = re.compile(r'^(\w{2,}(\s+\w{2,}){0,3})\s+-\s+(\w{2,}(\s+\w{2,}){0,3})$')
 
     async with sema:
-        if YANDEX_URL_RE.search(text) or VK_AUDIO_URL_RE.search(text):
+        if YANDEX_URL_RE.search(text):
             audio_filename = None
             try:
                 audio_filename = download_audio_by_url(text)
