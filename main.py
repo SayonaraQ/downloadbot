@@ -2,6 +2,8 @@ import os
 import re
 import logging
 import glob
+import subprocess
+import shutil
 from asyncio import Semaphore
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
@@ -10,21 +12,46 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Настройка логирования
+RU_PROXY = os.getenv("RU_PROXY")
+YA_COOKIES_FILE = os.getenv("YA_COOKIES_FILE")
+VK_COOKIES_FILE = os.getenv("VK_COOKIES_FILE")
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ID администратора
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-# Файл для хранения пользователей
 USERS_FILE = "data/users.txt"
 
-# Ограничение на количество одновременных загрузок
 sema = Semaphore(5)
+
+def auto_update_ytdlp() -> None:
+    try:
+        logger.info("Проверяю обновления yt-dlp…")
+        subprocess.run(
+            [os.sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        if shutil.which("ffmpeg") is None:
+            logger.warning("ffmpeg не найден в PATH — аудио-конвертация может не работать")
+    except Exception as e:
+        logger.warning(f"Не удалось обновить yt-dlp автоматически: {e}")
+
+def ytdlp_opts_base(outtmpl: str | None = None, proxy: str | None = None, cookiefile: str | None = None) -> dict:
+    opts = {
+        'quiet': True,
+        'nocheckcertificate': True,
+        'outtmpl': outtmpl or '%(title)s.%(ext)s',
+    }
+    if proxy:
+        opts['proxy'] = proxy
+        opts['geo_verification_proxy'] = proxy
+    if cookiefile and os.path.exists(cookiefile):
+        opts['cookiefile'] = cookiefile
+    return opts
 
 def save_user(chat_id):
     """Сохраняет chat_id пользователя в файл, если его ещё нет."""
@@ -56,7 +83,6 @@ async def start_command(update: Update, context):
     )
 
 async def get_users_count(update: Update, context):
-    """Команда /users: показывает количество пользователей (только для ADMIN_ID)."""
     if update.message.chat_id != ADMIN_ID:
         await update.message.reply_text("❌ У вас нет прав на выполнение этой команды.")
         return
@@ -106,7 +132,6 @@ def download_video(url: str) -> str:
     video_id = info_dict['id']
     outtmpl = f"{video_id}.%(ext)s"
 
-    # Настройки загрузки
     ydl_opts = {
         'format': 'best',
         'outtmpl': outtmpl,
@@ -116,7 +141,6 @@ def download_video(url: str) -> str:
     with YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
 
-    # Поиск скачанного файла с любым расширением
     downloaded_files = glob.glob(f"{video_id}.*")
     if not downloaded_files:
         raise FileNotFoundError(f"Файл {video_id} не найден после загрузки.")
@@ -124,7 +148,7 @@ def download_video(url: str) -> str:
     return downloaded_files[0]  # Возвращает путь к реальному файлу
 
 def download_music(query: str) -> str:
-    """Скачивает музыку и конвертирует в MP3."""
+    """Скачивает музыку и конвертирует в MP3 (поиск на YouTube)."""
     ydl_opts = {
         'format': 'bestaudio/best',
         'outtmpl': '%(title)s.%(ext)s',
@@ -141,11 +165,69 @@ def download_music(query: str) -> str:
             if not info_dict.get('entries'):
                 raise Exception("Ничего не найдено.")
 
-            audio_filename = ydl.prepare_filename(info_dict['entries'][0]).replace(".webm", ".mp3").replace(".m4a", ".mp3")
+            audio_filename = ydl.prepare_filename(info_dict['entries'][0]) \
+                .replace(".webm", ".mp3").replace(".m4a", ".mp3")
             return audio_filename
         except Exception as e:
             logger.error(f"Ошибка при загрузке музыки: {e}")
             raise
+
+YANDEX_URL_RE = re.compile(r'https?://(?:(?:www|m)\.)?music\.yandex\.(?:ru|by|kz|ua)/', re.I)
+VK_AUDIO_URL_RE = re.compile(r'https?://(?:(?:www|m)\.)?vk\.com/(?:audio|music)', re.I)
+
+def download_audio_by_url(url: str) -> str:
+    is_yandex = bool(YANDEX_URL_RE.search(url))
+    is_vk_audio = bool(VK_AUDIO_URL_RE.search(url))
+
+    cookiefile = None
+    proxy = None
+
+    if is_yandex:
+        cookiefile = YA_COOKIES_FILE
+        proxy = RU_PROXY  # для ЯМузыки ходим через RU-прокси
+    elif is_vk_audio:
+        cookiefile = VK_COOKIES_FILE or None
+        proxy = RU_PROXY  # при желании тоже через RU
+
+    noplaylist = "/track/" in url
+
+    ydl_opts = ytdlp_opts_base(outtmpl="%(title)s.%(ext)s", proxy=proxy, cookiefile=cookiefile)
+    ydl_opts.update({
+        "format": "bestaudio/best",
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+        "noplaylist": noplaylist,
+        "yesplaylist": not noplaylist,
+        # Чуть больше устойчивости сети:
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 3,
+        "concurrent_fragment_downloads": 4,
+    })
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+
+        # Если это плейлист/альбом — берём первый элемент, чтобы не менять старое поведение
+        entry = None
+        if isinstance(info, dict) and info.get("entries"):
+            entry = info["entries"][0]
+        else:
+            entry = info
+
+        prepared = ydl.prepare_filename(entry)
+        audio_filename = prepared.replace(".webm", ".mp3").replace(".m4a", ".mp3").replace(".opus", ".mp3")
+
+        if not os.path.exists(audio_filename):
+            candidates = glob.glob("*.mp3")
+            if not candidates:
+                raise FileNotFoundError("Не удалось найти итоговый MP3.")
+            audio_filename = max(candidates, key=os.path.getmtime)
+
+    return audio_filename
 
 async def handle_message(update: Update, context):
     """Обрабатывает сообщения, сохраняет chat_id и загружает видео/музыку."""
@@ -165,6 +247,17 @@ async def handle_message(update: Update, context):
     music_pattern = re.compile(r'^(\w{2,}(\s+\w{2,}){0,3})\s+-\s+(\w{2,}(\s+\w{2,}){0,3})$')
 
     async with sema:
+        if YANDEX_URL_RE.search(text) or VK_AUDIO_URL_RE.search(text):
+            try:
+                audio_filename = download_audio_by_url(text)
+                with open(audio_filename, 'rb') as audio_file:
+                    await update.message.reply_audio(audio=audio_file, title=text)
+                os.remove(audio_filename)
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                await update.message.reply_text("Не удалось загрузить музыку.")
+            return
+
         if (instagram_pattern.match(text) or tiktok_pattern.match(text) or
             youtube_pattern.match(text) or vk_pattern.match(text)):
             try:
@@ -189,15 +282,15 @@ async def handle_message(update: Update, context):
                 await update.message.reply_text("Не удалось загрузить музыку.")
 
 def main():
+    auto_update_ytdlp()
+
     token = os.getenv("TOKEN")
     application = ApplicationBuilder().token(token).build()
 
-    # Добавляем обработчики
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CommandHandler("users", get_users_count))
     application.add_handler(CommandHandler("start", start_command))
 
-    # Запускаем бота
     application.run_polling()
 
 if __name__ == "__main__":
