@@ -4,6 +4,8 @@ import logging
 import glob
 import subprocess
 import shutil
+import http.cookiejar as cookiejar
+import requests
 from asyncio import Semaphore
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters
@@ -175,7 +177,50 @@ def download_music(query: str) -> str:
 YANDEX_URL_RE = re.compile(r'https?://(?:(?:www|m)\.)?music\.yandex\.(?:ru|by|kz|ua)/', re.I)
 VK_AUDIO_URL_RE = re.compile(r'https?://(?:(?:www|m)\.)?vk\.com/(?:audio|music)', re.I)
 
+def _resolve_yandex_album_track_url(url: str, proxy: str | None, cookiefile: str | None) -> str:
+    """
+    /track/<id> → /album/<album_id>/track/<id> по og:url/canonical.
+    Если не выйдет, вернём исходный url.
+    """
+    try:
+        if "/album/" in url and "/track/" in url:
+            return url
+        if not re.search(r"/track/\d+", url):
+            return url
+
+        session = requests.Session()
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.yandex.ru/"}
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+
+        if cookiefile and os.path.exists(cookiefile):
+            cj = cookiejar.MozillaCookieJar()
+            cj.load(cookiefile, ignore_expires=True, ignore_discard=True)
+            session.cookies = cj
+
+        html = session.get(url, headers=headers, proxies=proxies, timeout=15).text
+
+        # og:url
+        m = re.search(
+            r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
+            html, re.I)
+        if m:
+            return m.group(1)
+
+        # canonical
+        m = re.search(
+            r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
+            html, re.I)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return url
+
 def download_audio_by_url(url: str) -> str:
+    import re
+    import http.cookiejar as cookiejar
+    import requests
+
     is_yandex = bool(YANDEX_URL_RE.search(url))
     is_vk_audio = bool(VK_AUDIO_URL_RE.search(url))
 
@@ -189,6 +234,34 @@ def download_audio_by_url(url: str) -> str:
         cookiefile = VK_COOKIES_FILE or None
         proxy = RU_PROXY  # при желании тоже через RU
 
+    # ---- Нормализуем ссылку ЯМузыки /track/<id> -> /album/<album_id>/track/<id> ----
+    if is_yandex and "/track/" in url and "/album/" not in url:
+        try:
+            sess = requests.Session()
+            headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://music.yandex.ru/"}
+            proxies = {"http": proxy, "https": proxy} if proxy else None
+            if cookiefile and os.path.exists(cookiefile):
+                cj = cookiejar.MozillaCookieJar()
+                cj.load(cookiefile, ignore_expires=True, ignore_discard=True)
+                sess.cookies = cj
+            html = sess.get(url, headers=headers, proxies=proxies, timeout=15).text
+            # og:url
+            m = re.search(
+                r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
+                html, re.I)
+            if m:
+                url = m.group(1)
+            else:
+                # canonical
+                m = re.search(
+                    r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
+                    html, re.I)
+                if m:
+                    url = m.group(1)
+        except Exception:
+            pass
+
+    # Одиночный трек — без плейлиста; альбом/плейлист — разрешаем плейлист
     noplaylist = "/track/" in url
 
     ydl_opts = ytdlp_opts_base(outtmpl="%(title)s.%(ext)s", proxy=proxy, cookiefile=cookiefile)
@@ -201,25 +274,33 @@ def download_audio_by_url(url: str) -> str:
         }],
         "noplaylist": noplaylist,
         "yesplaylist": not noplaylist,
-        # Чуть больше устойчивости сети:
+        # устойчивость сети
         "retries": 10,
         "fragment_retries": 10,
         "extractor_retries": 3,
         "concurrent_fragment_downloads": 4,
     })
 
+    # Для ЯМузыки полезно указать заголовки
+    if is_yandex:
+        ydl_opts.setdefault("http_headers", {})
+        ydl_opts["http_headers"].update({
+            "Referer": "https://music.yandex.ru/",
+            "User-Agent": "Mozilla/5.0",
+        })
+
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
 
-        # Если это плейлист/альбом — берём первый элемент, чтобы не менять старое поведение
-        entry = None
-        if isinstance(info, dict) and info.get("entries"):
-            entry = info["entries"][0]
-        else:
-            entry = info
+        # Если это плейлист/альбом — берём первый элемент (сохраняем прежнее поведение)
+        entry = info["entries"][0] if isinstance(info, dict) and info.get("entries") else info
 
+        # Имя файла после постпроцессора (mp3)
         prepared = ydl.prepare_filename(entry)
-        audio_filename = prepared.replace(".webm", ".mp3").replace(".m4a", ".mp3").replace(".opus", ".mp3")
+        audio_filename = (prepared
+                          .replace(".webm", ".mp3")
+                          .replace(".m4a", ".mp3")
+                          .replace(".opus", ".mp3"))
 
         if not os.path.exists(audio_filename):
             candidates = glob.glob("*.mp3")
@@ -248,14 +329,21 @@ async def handle_message(update: Update, context):
 
     async with sema:
         if YANDEX_URL_RE.search(text) or VK_AUDIO_URL_RE.search(text):
+            audio_filename = None
             try:
                 audio_filename = download_audio_by_url(text)
-                with open(audio_filename, 'rb') as audio_file:
-                    await update.message.reply_audio(audio=audio_file, title=text)
-                os.remove(audio_filename)
+                from os.path import basename, splitext
+                with open(audio_filename, "rb") as audio_file:
+                    await update.message.reply_audio(
+                        audio=audio_file,
+                        title=splitext(basename(audio_filename))[0],
+                    )
             except Exception as e:
                 logger.error(f"Ошибка: {e}")
                 await update.message.reply_text("Не удалось загрузить музыку.")
+            finally:
+                if audio_filename and os.path.exists(audio_filename):
+                    os.remove(audio_filename)
             return
 
         if (instagram_pattern.match(text) or tiktok_pattern.match(text) or
