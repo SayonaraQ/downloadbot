@@ -1,0 +1,31 @@
+version: "3.9"
+
+services:
+  downloadbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: downloadbot_enhanced_v2:latest
+    container_name: downloadbot_enhanced_v2
+
+    env_file:
+      - .env
+
+    # Для нормальных логов в docker (чтобы было видно, что происходит сразу)
+    environment:
+      PYTHONUNBUFFERED: "1"
+
+    # Том для кэша/временных файлов + cookies (лучше read-only)
+    volumes:
+      - ./data:/app/data
+      - ./cookies:/app/cookies:ro
+
+    restart: unless-stopped
+    init: true
+
+    # Чтобы логи не разрастались бесконечно
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
