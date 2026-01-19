@@ -374,6 +374,36 @@ def _iter_entries(info: Any) -> Iterable[dict[str, Any]]:
     elif isinstance(info, dict):
         yield info
 
+def _extract_ig_story_id(url: str) -> str | None:
+    """Extract numeric story id from an Instagram /stories/<user>/<id>/ URL."""
+    m = re.search(r"/stories/[^/]+/(\d+)", url)
+    return m.group(1) if m else None
+
+
+def _filter_entries_by_id(info: Any, wanted_id: str) -> Any:
+    """If info is a playlist-like dict, keep only entry matching wanted_id (best effort)."""
+    if not wanted_id:
+        return info
+    if not isinstance(info, dict) or not info.get("entries"):
+        return info
+
+    entries = list(info.get("entries") or [])
+    filtered: list[dict] = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        eid = str(e.get("id") or e.get("display_id") or e.get("media_id") or "")
+        if eid == wanted_id:
+            filtered.append(e)
+
+    if not filtered:
+        return info
+
+    out = dict(info)
+    out["entries"] = filtered
+    return out
+
+
 
 def _check_duration_limit(info: Any) -> None:
     for entry in _iter_entries(info):
@@ -404,8 +434,31 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
 
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
-        _check_duration_limit(info)
-        ydl.download([url])
+
+        # If it's an Instagram story link with explicit id, try to download exactly that story
+        selected_info = info
+        wanted_story_id = _extract_ig_story_id(url) if site == "instagram" else None
+        if wanted_story_id:
+            selected_info = _filter_entries_by_id(info, wanted_story_id)
+
+        _check_duration_limit(selected_info)
+
+        # Decide what to download:
+        # - If we filtered playlist entries to the requested story id, download those entry URLs
+        # - Otherwise download the original URL (best effort)
+        targets: list[str] = []
+        if wanted_story_id and isinstance(selected_info, dict) and selected_info.get("entries"):
+            for e in selected_info.get("entries") or []:
+                if not isinstance(e, dict):
+                    continue
+                t = e.get("webpage_url") or e.get("url")
+                if isinstance(t, str) and t:
+                    targets.append(t)
+
+        if not targets:
+            targets = [url]
+
+        ydl.download(targets)
 
     # collect downloaded files
     all_files: list[Path] = []
@@ -534,51 +587,118 @@ async def _send_media_group(
     caption: str | None,
     parse_mode: str | None = None,
 ) -> list[str]:
-    """Send album (photos/videos). Returns list of Telegram file_ids."""
+    """Send album (photos/videos). Returns list of Telegram file_ids.
+
+    Telegram can sometimes reject sendMediaGroup with errors like:
+    "Can't parse inputmedia: media not found".
+
+    We try sendMediaGroup first; if it fails, we fall back to sending items one-by-one.
+    """
     chat_id = update.effective_chat.id
+
+    def _cap(i: int) -> str | None:
+        return caption if i == 0 else None
+
+    def _pm(i: int) -> str | None:
+        return parse_mode if i == 0 else None
 
     # Decide if we can use file_ids entirely
     can_use_file_ids = all(it.get("tg_file_id") and isinstance(it.get("tg_file_id"), str) for it in items)
 
-    media_group = []
-    if can_use_file_ids:
-        for i, it in enumerate(items):
-            kind = it["kind"]
-            file_id = it["tg_file_id"]
-            if kind == "photo":
-                media_group.append(InputMediaPhoto(media=file_id, caption=caption if i == 0 else None, parse_mode=parse_mode if i == 0 else None))
+    async def _send_one(it: dict[str, Any], *, i: int) -> str:
+        kind = it.get("kind")
+        tg_file_id = it.get("tg_file_id")
+        abs_path = it.get("abs_path")
+
+        # Prefer Telegram file_id
+        if isinstance(tg_file_id, str) and tg_file_id:
+            return await _send_single_item(
+                update,
+                context,
+                kind=kind,
+                media=tg_file_id,
+                caption=_cap(i),
+                parse_mode=_pm(i),
+            )
+
+        if not abs_path:
+            return ""
+
+        path = Path(abs_path)
+        if not path.exists() or not path.is_file():
+            logger.warning("Файл для отправки не найден: %s", str(path))
+            return ""
+
+        return await _send_single_item(
+            update,
+            context,
+            kind=kind,
+            media=path,
+            caption=_cap(i),
+            parse_mode=_pm(i),
+        )
+
+    # First try: media group
+    try:
+        media_group: list[Any] = []
+
+        if can_use_file_ids:
+            for i, it in enumerate(items):
+                kind = it["kind"]
+                file_id = it["tg_file_id"]
+                if kind == "photo":
+                    media_group.append(InputMediaPhoto(media=file_id, caption=_cap(i), parse_mode=_pm(i)))
+                else:
+                    media_group.append(InputMediaVideo(media=file_id, caption=_cap(i), parse_mode=_pm(i), supports_streaming=True))
+
+            msgs = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+            # file_ids are already known; still return them
+            return [it["tg_file_id"] for it in items]
+
+        # Send from local files (with filenames!)
+        with ExitStack() as stack:
+            for i, it in enumerate(items):
+                kind = it["kind"]
+                path = Path(it["abs_path"])
+                if not path.exists() or not path.is_file():
+                    raise FileNotFoundError(f"Missing media file: {path}")
+
+                fp = stack.enter_context(path.open("rb"))
+                input_file = InputFile(fp, filename=path.name)
+
+                if kind == "photo":
+                    media_group.append(InputMediaPhoto(media=input_file, caption=_cap(i), parse_mode=_pm(i)))
+                else:
+                    media_group.append(InputMediaVideo(media=input_file, caption=_cap(i), parse_mode=_pm(i), supports_streaming=True))
+
+            msgs = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+
+        # Extract returned file_ids
+        out_ids: list[str] = []
+        for msg in msgs:
+            if msg.photo:
+                out_ids.append(msg.photo[-1].file_id)
+            elif msg.video:
+                out_ids.append(msg.video.file_id)
+            elif msg.document:
+                out_ids.append(msg.document.file_id)
             else:
-                media_group.append(InputMediaVideo(media=file_id, caption=caption if i == 0 else None, parse_mode=parse_mode if i == 0 else None, supports_streaming=True))
-        msgs = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-        # file_ids are already known; still return them
-        return [it["tg_file_id"] for it in items]
+                out_ids.append("")
+        return out_ids
 
-    # Send from local files
-    with ExitStack() as stack:
-        for i, it in enumerate(items):
-            kind = it["kind"]
-            path = Path(it["abs_path"])
-            fp = stack.enter_context(path.open("rb"))
-            input_file = InputFile(fp)
-            if kind == "photo":
-                media_group.append(InputMediaPhoto(media=input_file, caption=caption if i == 0 else None, parse_mode=parse_mode if i == 0 else None))
-            else:
-                media_group.append(InputMediaVideo(media=input_file, caption=caption if i == 0 else None, parse_mode=parse_mode if i == 0 else None, supports_streaming=True))
+    except Exception as e:
+        logger.warning("sendMediaGroup не удался (%s). Отправляю по одному.", str(e))
 
-        msgs = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+    # Fallback: send one-by-one
+    out: list[str] = []
+    for i, it in enumerate(items):
+        try:
+            out.append(await _send_one(it, i=i))
+        except Exception as e:
+            logger.warning("Не удалось отправить элемент %d/%d: %s", i + 1, len(items), str(e))
+            out.append("")
 
-    # Extract returned file_ids
-    out_ids: list[str] = []
-    for msg in msgs:
-        if msg.photo:
-            out_ids.append(msg.photo[-1].file_id)
-        elif msg.video:
-            out_ids.append(msg.video.file_id)
-        elif msg.document:
-            out_ids.append(msg.document.file_id)
-        else:
-            out_ids.append("")
-    return out_ids
+    return out
 
 
 async def send_cache_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, entry: dict[str, Any]) -> None:
