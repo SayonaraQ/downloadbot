@@ -81,8 +81,21 @@ RU_PROXY = os.getenv("RU_PROXY")
 YA_COOKIES_FILE = os.getenv("YA_COOKIES_FILE")
 
 # Format selection (yt-dlp)
-VIDEO_FORMAT = os.getenv("VIDEO_FORMAT", "bv*+ba/best")
+DEFAULT_VIDEO_FORMAT = (
+    "bestvideo[vcodec~='^(avc1|avc3|h264)'][ext=mp4]+bestaudio[acodec~='^(mp4a|aac)'][ext=m4a]/"
+    "bestvideo[vcodec~='^(avc1|avc3|h264)']+bestaudio[acodec~='^(mp4a|aac)']/"
+    "best[vcodec~='^(avc1|avc3|h264)'][ext=mp4]/"
+    "best[vcodec~='^(avc1|avc3|h264)']/"
+    "bv*[ext=mp4]+ba[ext=m4a]/"
+    "bv*+ba/best"
+)
+VIDEO_FORMAT = os.getenv("VIDEO_FORMAT", DEFAULT_VIDEO_FORMAT)
 MERGE_OUTPUT_FORMAT = os.getenv("MERGE_OUTPUT_FORMAT", "mp4")
+
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
+IOS_SAFE_VIDEO_CODEC = "h264"
+IOS_SAFE_AUDIO_CODECS = {"aac"}
+IOS_SAFE_PIXEL_FORMATS = {"yuv420p"}
 
 # Cookie fallback lists (comma / semicolon / newline separated)
 COOKIES_FILES = os.getenv("COOKIES_FILES") or os.getenv("COOKIES_FILE")
@@ -135,8 +148,10 @@ def auto_update_ytdlp() -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        if shutil.which("ffmpeg") is None:
-            logger.warning("ffmpeg не найден в PATH — конвертация/склейка может не работать")
+        ffmpeg_path = shutil.which("ffmpeg")
+        ffprobe_path = shutil.which("ffprobe")
+        if ffmpeg_path is None or ffprobe_path is None:
+            logger.warning("ffmpeg/ffprobe не найдены в PATH — конвертация и проверка кодеков могут не работать")
     except Exception as e:
         logger.warning(f"Не удалось обновить yt-dlp автоматически: {e}")
 
@@ -407,9 +422,179 @@ def _classify_file(path: Path) -> str:
     ext = path.suffix.lower()
     if ext in {".jpg", ".jpeg", ".png", ".webp"}:
         return "photo"
-    if ext in {".mp4", ".mkv", ".webm", ".mov"}:
+    if ext in VIDEO_EXTENSIONS:
         return "video"
     return "document"
+
+
+def _probe_media(path: Path) -> dict[str, Any] | None:
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path is None:
+        return None
+
+    result = subprocess.run(
+        [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"ffprobe завершился с кодом {result.returncode}")
+
+    return json.loads(result.stdout or "{}")
+
+
+def _needs_ios_video_normalization(path: Path, probe: dict[str, Any]) -> tuple[bool, str]:
+    streams = probe.get("streams") or []
+    format_info = probe.get("format") or {}
+    format_names = {
+        part.strip().lower()
+        for part in str(format_info.get("format_name") or "").split(",")
+        if part.strip()
+    }
+
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+
+    if not video_stream:
+        return False, ""
+
+    reasons: list[str] = []
+
+    if "mp4" not in format_names:
+        reasons.append(f"container={','.join(sorted(format_names)) or path.suffix.lower().lstrip('.')}")
+
+    video_codec = str(video_stream.get("codec_name") or "").lower()
+    if video_codec != IOS_SAFE_VIDEO_CODEC:
+        reasons.append(f"video={video_codec or 'unknown'}")
+
+    pixel_format = str(video_stream.get("pix_fmt") or "").lower()
+    if pixel_format and pixel_format not in IOS_SAFE_PIXEL_FORMATS:
+        reasons.append(f"pix_fmt={pixel_format}")
+
+    if audio_stream:
+        audio_codec = str(audio_stream.get("codec_name") or "").lower()
+        if audio_codec not in IOS_SAFE_AUDIO_CODECS:
+            reasons.append(f"audio={audio_codec or 'unknown'}")
+
+    return bool(reasons), ", ".join(reasons)
+
+
+def _unique_ios_output_path(path: Path) -> Path:
+    candidate = path.with_name(f"{path.stem}_ios.mp4")
+    counter = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}_ios_{counter}.mp4")
+        counter += 1
+    return candidate
+
+
+def _normalize_video_for_ios(path: Path) -> Path:
+    if _classify_file(path) != "video":
+        return path
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
+    if ffmpeg_path is None or ffprobe_path is None:
+        logger.warning("Пропускаю проверку совместимости видео: ffmpeg/ffprobe недоступны")
+        return path
+
+    probe = _probe_media(path)
+    if probe is None:
+        return path
+
+    needs_normalization, reason = _needs_ios_video_normalization(path, probe)
+    if not needs_normalization:
+        return path
+
+    streams = probe.get("streams") or []
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if video_stream is None:
+        return path
+
+    target = _unique_ios_output_path(path)
+
+    cmd = [
+        ffmpeg_path,
+        "-y",
+        "-i",
+        str(path),
+        "-map",
+        "0:v:0",
+        "-map_metadata",
+        "0",
+    ]
+
+    if audio_stream:
+        cmd.extend(["-map", "0:a:0"])
+    else:
+        cmd.append("-an")
+
+    video_codec = str(video_stream.get("codec_name") or "").lower()
+    pixel_format = str(video_stream.get("pix_fmt") or "").lower()
+    video_copy_ok = video_codec == IOS_SAFE_VIDEO_CODEC and pixel_format in IOS_SAFE_PIXEL_FORMATS
+    if video_copy_ok:
+        cmd.extend(["-c:v", "copy"])
+    else:
+        cmd.extend([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+
+    if audio_stream:
+        audio_codec = str(audio_stream.get("codec_name") or "").lower()
+        if audio_codec in IOS_SAFE_AUDIO_CODECS:
+            cmd.extend(["-c:a", "copy"])
+        else:
+            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+
+    cmd.extend(["-movflags", "+faststart", str(target)])
+
+    logger.info("Нормализую видео для iPhone: %s (%s)", path.name, reason)
+    result = subprocess.run(
+        cmd,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        target.unlink(missing_ok=True)
+        raise RuntimeError(result.stderr.strip() or f"ffmpeg завершился с кодом {result.returncode}")
+
+    path.unlink(missing_ok=True)
+    return target
+
+
+def _normalize_downloaded_files(files: list[Path]) -> list[Path]:
+    normalized: list[Path] = []
+    for path in files:
+        if _classify_file(path) != "video":
+            normalized.append(path)
+            continue
+        try:
+            normalized.append(_normalize_video_for_ios(path))
+        except Exception as e:
+            logger.warning("Не удалось нормализовать видео %s: %s", path.name, e)
+            normalized.append(path)
+    return normalized
 
 
 def _ytdlp_common_opts(outtmpl: str, cookiefile: str | None = None, proxy: str | None = None) -> dict[str, Any]:
@@ -546,6 +731,7 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
 
     # sort stable for albums
     all_files.sort(key=lambda p: p.name)
+    all_files = _normalize_downloaded_files(all_files)
 
     title = None
     try:
