@@ -82,10 +82,10 @@ YA_COOKIES_FILE = os.getenv("YA_COOKIES_FILE")
 
 # Format selection (yt-dlp)
 DEFAULT_VIDEO_FORMAT = (
-    "bestvideo[vcodec~='^(avc1|avc3|h264)'][ext=mp4]+bestaudio[acodec~='^(mp4a|aac)'][ext=m4a]/"
-    "bestvideo[vcodec~='^(avc1|avc3|h264)']+bestaudio[acodec~='^(mp4a|aac)']/"
-    "best[vcodec~='^(avc1|avc3|h264)'][ext=mp4]/"
-    "best[vcodec~='^(avc1|avc3|h264)']/"
+    "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
+    "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+    "best[vcodec^=avc1][ext=mp4]/"
+    "best[vcodec^=avc1]/"
     "bv*[ext=mp4]+ba[ext=m4a]/"
     "bv*+ba/best"
 )
@@ -96,6 +96,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
 IOS_SAFE_VIDEO_CODEC = "h264"
 IOS_SAFE_AUDIO_CODECS = {"aac"}
 IOS_SAFE_PIXEL_FORMATS = {"yuv420p"}
+IOS_TRANSCODE_ENABLED = (os.getenv("IOS_TRANSCODE_ENABLED", "0").strip() != "0")
 
 # Cookie fallback lists (comma / semicolon / newline separated)
 COOKIES_FILES = os.getenv("COOKIES_FILES") or os.getenv("COOKIES_FILE")
@@ -544,6 +545,20 @@ def _normalize_video_for_ios(path: Path) -> Path:
     video_codec = str(video_stream.get("codec_name") or "").lower()
     pixel_format = str(video_stream.get("pix_fmt") or "").lower()
     video_copy_ok = video_codec == IOS_SAFE_VIDEO_CODEC and pixel_format in IOS_SAFE_PIXEL_FORMATS
+    audio_copy_ok = False
+    if audio_stream:
+        audio_codec = str(audio_stream.get("codec_name") or "").lower()
+        audio_copy_ok = audio_codec in IOS_SAFE_AUDIO_CODECS
+
+    if not IOS_TRANSCODE_ENABLED and not (video_copy_ok and (audio_copy_ok or not audio_stream)):
+        logger.warning(
+            "Пропускаю тяжёлую перекодировку для %s (%s). "
+            "Оставляю исходный файл; чтобы включить транскодирование, задай IOS_TRANSCODE_ENABLED=1",
+            path.name,
+            reason,
+        )
+        return path
+
     if video_copy_ok:
         cmd.extend(["-c:v", "copy"])
     else:
@@ -559,8 +574,7 @@ def _normalize_video_for_ios(path: Path) -> Path:
         ])
 
     if audio_stream:
-        audio_codec = str(audio_stream.get("codec_name") or "").lower()
-        if audio_codec in IOS_SAFE_AUDIO_CODECS:
+        if audio_copy_ok:
             cmd.extend(["-c:a", "copy"])
         else:
             cmd.extend(["-c:a", "aac", "-b:a", "192k"])
