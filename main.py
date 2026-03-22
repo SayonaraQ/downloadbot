@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -96,7 +97,13 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
 IOS_SAFE_VIDEO_CODEC = "h264"
 IOS_SAFE_AUDIO_CODECS = {"aac"}
 IOS_SAFE_PIXEL_FORMATS = {"yuv420p"}
-IOS_TRANSCODE_ENABLED = (os.getenv("IOS_TRANSCODE_ENABLED", "0").strip() != "0")
+IOS_TRANSCODE_ENABLED = (os.getenv("IOS_TRANSCODE_ENABLED", "1").strip() != "0")
+IOS_TRANSCODE_MAX_PARALLEL = max(1, int(os.getenv("IOS_TRANSCODE_MAX_PARALLEL", "1")))
+IOS_TRANSCODE_PRESET = os.getenv("IOS_TRANSCODE_PRESET", "ultrafast").strip() or "ultrafast"
+IOS_TRANSCODE_CRF = max(18, int(os.getenv("IOS_TRANSCODE_CRF", "28")))
+IOS_TRANSCODE_MAX_HEIGHT = max(240, int(os.getenv("IOS_TRANSCODE_MAX_HEIGHT", "720")))
+IOS_TRANSCODE_MAX_WIDTH = max(240, int(os.getenv("IOS_TRANSCODE_MAX_WIDTH", "1280")))
+IOS_TRANSCODE_MAX_FPS = max(1, int(os.getenv("IOS_TRANSCODE_MAX_FPS", "30")))
 
 # Cookie fallback lists (comma / semicolon / newline separated)
 COOKIES_FILES = os.getenv("COOKIES_FILES") or os.getenv("COOKIES_FILE")
@@ -107,6 +114,7 @@ VK_COOKIES_FILES = os.getenv("VK_COOKIES_FILES") or os.getenv("VK_COOKIES_FILE")
 
 # Semaphore to limit parallel downloads
 sema = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+ios_transcode_sema = threading.Semaphore(IOS_TRANSCODE_MAX_PARALLEL)
 
 # Per-URL locks to avoid duplicate downloads
 _cache_locks: dict[str, asyncio.Lock] = {}
@@ -500,6 +508,15 @@ def _unique_ios_output_path(path: Path) -> Path:
     return candidate
 
 
+def _ios_video_filter() -> str:
+    return (
+        f"scale=w='min({IOS_TRANSCODE_MAX_WIDTH},iw)':"
+        f"h='min({IOS_TRANSCODE_MAX_HEIGHT},ih)':"
+        "force_original_aspect_ratio=decrease,"
+        f"fps={IOS_TRANSCODE_MAX_FPS}"
+    )
+
+
 def _normalize_video_for_ios(path: Path) -> Path:
     if _classify_file(path) != "video":
         return path
@@ -545,6 +562,7 @@ def _normalize_video_for_ios(path: Path) -> Path:
     video_codec = str(video_stream.get("codec_name") or "").lower()
     pixel_format = str(video_stream.get("pix_fmt") or "").lower()
     video_copy_ok = video_codec == IOS_SAFE_VIDEO_CODEC and pixel_format in IOS_SAFE_PIXEL_FORMATS
+    needs_video_transcode = not video_copy_ok
     audio_copy_ok = False
     if audio_stream:
         audio_codec = str(audio_stream.get("codec_name") or "").lower()
@@ -566,9 +584,11 @@ def _normalize_video_for_ios(path: Path) -> Path:
             "-c:v",
             "libx264",
             "-preset",
-            "veryfast",
+            IOS_TRANSCODE_PRESET,
             "-crf",
-            "23",
+            str(IOS_TRANSCODE_CRF),
+            "-vf",
+            _ios_video_filter(),
             "-pix_fmt",
             "yuv420p",
         ])
@@ -582,13 +602,30 @@ def _normalize_video_for_ios(path: Path) -> Path:
     cmd.extend(["-movflags", "+faststart", str(target)])
 
     logger.info("Нормализую видео для iPhone: %s (%s)", path.name, reason)
-    result = subprocess.run(
-        cmd,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    if needs_video_transcode:
+        logger.info(
+            "Ожидаю слот перекодировки iPhone для %s (max_parallel=%d)",
+            path.name,
+            IOS_TRANSCODE_MAX_PARALLEL,
+        )
+
+    if needs_video_transcode:
+        with ios_transcode_sema:
+            result = subprocess.run(
+                cmd,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+    else:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
     if result.returncode != 0:
         target.unlink(missing_ok=True)
         raise RuntimeError(result.stderr.strip() or f"ffmpeg завершился с кодом {result.returncode}")
