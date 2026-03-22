@@ -52,6 +52,16 @@ ADMIN_ID = int((os.getenv("ADMIN_ID") or "0").strip() or "0")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 USERS_FILE = DATA_DIR / "users.txt"
+IG_USER_COOKIES_DIR = DATA_DIR / "ig_user_cookies"
+MAX_COOKIE_UPLOAD_SIZE_MB = int(os.getenv("MAX_COOKIE_UPLOAD_SIZE_MB", "2"))
+EXPECTING_IG_COOKIE_KEY = "awaiting_instagram_cookie_upload"
+
+# Runtime mode
+WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").strip()
+WEBHOOK_LISTEN = (os.getenv("WEBHOOK_LISTEN") or "0.0.0.0").strip()
+WEBHOOK_PORT = int((os.getenv("WEBHOOK_PORT") or "8080").strip())
+WEBHOOK_PATH = (os.getenv("WEBHOOK_PATH") or "").strip()
+WEBHOOK_SECRET_TOKEN = (os.getenv("WEBHOOK_SECRET_TOKEN") or "").strip()
 
 # Cache settings
 CACHE_DIR = Path(os.getenv("CACHE_DIR", str(DATA_DIR / "cache")))
@@ -112,6 +122,7 @@ MUSIC_PATTERN = re.compile(r"^(\w{2,}(\s+\w{2,}){0,3})\s+-\s+(\w{2,}(\s+\w{2,}){
 def _ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    IG_USER_COOKIES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def auto_update_ytdlp() -> None:
@@ -166,6 +177,60 @@ def _parse_cookie_files(value: str | None) -> list[str]:
     return existing
 
 
+def _uploaded_ig_cookie_path_for_user(user_id: int) -> Path:
+    return IG_USER_COOKIES_DIR / f"user_{user_id}.txt"
+
+
+def _list_uploaded_ig_cookie_files(preferred_user_id: int | None = None) -> list[str]:
+    _ensure_dirs()
+
+    preferred_path = _uploaded_ig_cookie_path_for_user(preferred_user_id) if preferred_user_id else None
+    ordered_paths: list[Path] = []
+
+    if preferred_path and preferred_path.exists():
+        ordered_paths.append(preferred_path)
+
+    for path in sorted(IG_USER_COOKIES_DIR.glob("user_*.txt")):
+        if not path.is_file():
+            continue
+        if preferred_path and path == preferred_path:
+            continue
+        ordered_paths.append(path)
+
+    return [str(path) for path in ordered_paths]
+
+
+def _validate_instagram_cookie_text(cookie_text: str) -> tuple[bool, str | None]:
+    has_netscape_rows = False
+    has_instagram_domain = False
+
+    for raw_line in cookie_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
+
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+
+        has_netscape_rows = True
+        domain = parts[0].strip().lower()
+        if "instagram.com" in domain:
+            has_instagram_domain = True
+            break
+
+    if not has_netscape_rows:
+        return False, "Файл не похож на Netscape cookies.txt (ожидаются строки с tab-разделителями)."
+    if not has_instagram_domain:
+        return False, "В файле не найдены cookies для instagram.com."
+
+    return True, None
+
+
 def _site_for_url(url: str) -> str:
     if INSTAGRAM_RE.match(url):
         return "instagram"
@@ -178,7 +243,7 @@ def _site_for_url(url: str) -> str:
     return "unknown"
 
 
-def _cookie_files_for_site(site: str) -> list[str]:
+def _cookie_files_for_site(site: str, preferred_user_id: int | None = None) -> list[str]:
     site_map = {
         "instagram": _parse_cookie_files(IG_COOKIES_FILES),
         "youtube": _parse_cookie_files(YT_COOKIES_FILES),
@@ -186,6 +251,10 @@ def _cookie_files_for_site(site: str) -> list[str]:
         "vk": _parse_cookie_files(VK_COOKIES_FILES),
     }
     result = site_map.get(site, [])
+
+    # Runtime-uploaded Instagram cookies (per-user + pool)
+    if site == "instagram":
+        result = _list_uploaded_ig_cookie_files(preferred_user_id) + result
 
     # fallback (global list)
     result += _parse_cookie_files(COOKIES_FILES)
@@ -491,9 +560,14 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
     }
 
 
-def download_media_with_fallback(url: str, tmp_dir: Path, site: str) -> dict[str, Any]:
+def download_media_with_fallback(
+    url: str,
+    tmp_dir: Path,
+    site: str,
+    preferred_user_id: int | None = None,
+) -> dict[str, Any]:
     """Try to download using no cookies (optional) and then multiple cookie files."""
-    cookie_files = _cookie_files_for_site(site)
+    cookie_files = _cookie_files_for_site(site, preferred_user_id=preferred_user_id)
 
     attempts: list[str | None] = []
     if TRY_NO_COOKIES_FIRST:
@@ -907,6 +981,84 @@ async def get_users_count(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("⚠ Ошибка при подсчёте пользователей.")
 
 
+async def pechenyuha_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+
+    context.user_data[EXPECTING_IG_COOKIE_KEY] = True
+    await update.message.reply_text(
+        "Пришли cookies файлом `.txt` (Netscape format).\n"
+        "Я сохраню его как твой Instagram cookies и буду использовать в очереди попыток скачивания.",
+        parse_mode="Markdown",
+    )
+
+
+async def handle_cookie_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.message.document is None:
+        return
+
+    if not context.user_data.get(EXPECTING_IG_COOKIE_KEY):
+        return
+
+    document = update.message.document
+    filename = (document.file_name or "").strip()
+    if not filename.lower().endswith(".txt"):
+        await update.message.reply_text("Нужен файл с расширением .txt.")
+        return
+
+    max_size_bytes = MAX_COOKIE_UPLOAD_SIZE_MB * 1024 * 1024
+    if document.file_size and document.file_size > max_size_bytes:
+        await update.message.reply_text(
+            f"Файл слишком большой. Максимум: {MAX_COOKIE_UPLOAD_SIZE_MB} MB."
+        )
+        return
+
+    user = update.effective_user
+    if user is None:
+        await update.message.reply_text("Не удалось определить пользователя. Попробуй ещё раз.")
+        return
+
+    _ensure_dirs()
+    tmp_path = IG_USER_COOKIES_DIR / f"upload_{user.id}_{int(_now())}.tmp"
+    final_path = _uploaded_ig_cookie_path_for_user(user.id)
+
+    try:
+        tg_file = await context.bot.get_file(document.file_id)
+        await tg_file.download_to_drive(custom_path=str(tmp_path))
+
+        if tmp_path.stat().st_size > max_size_bytes:
+            await update.message.reply_text(
+                f"Файл слишком большой. Максимум: {MAX_COOKIE_UPLOAD_SIZE_MB} MB."
+            )
+            return
+
+        cookie_text = tmp_path.read_text(encoding="utf-8", errors="ignore")
+        ok, reason = _validate_instagram_cookie_text(cookie_text)
+        if not ok:
+            await update.message.reply_text(
+                f"Файл отклонён: {reason}\nОтправь другой .txt.",
+            )
+            return
+
+        os.replace(tmp_path, final_path)
+        context.user_data.pop(EXPECTING_IG_COOKIE_KEY, None)
+
+        pool_size = len(_list_uploaded_ig_cookie_files())
+        await update.message.reply_text(
+            f"Cookies сохранены.\n"
+            f"Активных пользовательских Instagram cookies в пуле: {pool_size}."
+        )
+    except Exception as e:
+        logger.error(f"Ошибка загрузки пользовательских cookies: {e}")
+        await update.message.reply_text("Не удалось сохранить cookies. Попробуй ещё раз.")
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+
 def _looks_like_supported_video_url(text: str) -> bool:
     return bool(INSTAGRAM_RE.match(text) or TIKTOK_RE.match(text) or YOUTUBE_RE.match(text) or VK_RE.match(text))
 
@@ -918,6 +1070,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     text = update.message.text.strip()
     chat_id = update.message.chat_id
+    requester_id = update.effective_user.id if update.effective_user else None
 
     save_user(chat_id)
 
@@ -981,7 +1134,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 tmp_dir.mkdir(parents=True, exist_ok=True)
 
                 try:
-                    result = await asyncio.to_thread(download_media_with_fallback, url, tmp_dir, site)
+                    result = await asyncio.to_thread(
+                        download_media_with_fallback,
+                        url,
+                        tmp_dir,
+                        site,
+                        requester_id,
+                    )
 
                     files = [Path(p) for p in result["files"]]
                     # Apply MAX_ITEMS_PER_LINK also post-download (safety)
@@ -1023,8 +1182,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 except Exception as e:
                     logger.error(f"Ошибка: {e}")
                     await update.message.reply_text(
-                        "Не удалось загрузить медиа.\n"
-                        "Если это приватный/18+ контент — проверь cookies (авторизацию) и попробуй снова."
+                        "Не удалось загрузить. Возможно пора обновить cookies"
                     )
                     _purge_cache_entry(key)
                 finally:
@@ -1062,9 +1220,11 @@ def build_application() -> Application:
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("pechenyuha", pechenyuha_command))
     app.add_handler(CommandHandler("users", get_users_count))
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_cookie_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Cache cleanup job
     if app.job_queue:
@@ -1079,7 +1239,25 @@ def main() -> None:
     auto_update_ytdlp()
 
     application = build_application()
-    application.run_polling()
+    if WEBHOOK_URL:
+        path_part = (WEBHOOK_PATH or TOKEN or "webhook").strip("/")
+        url_path = f"/{path_part}" if path_part else ""
+        webhook_url = f"{WEBHOOK_URL.rstrip('/')}{url_path}"
+        logger.info(
+            f"Запуск в режиме webhook: {webhook_url} "
+            f"(listen={WEBHOOK_LISTEN}:{WEBHOOK_PORT}, secret_token={'on' if WEBHOOK_SECRET_TOKEN else 'off'})"
+        )
+        application.run_webhook(
+            listen=WEBHOOK_LISTEN,
+            port=WEBHOOK_PORT,
+            url_path=url_path,
+            webhook_url=webhook_url,
+            drop_pending_updates=True,
+            secret_token=WEBHOOK_SECRET_TOKEN or None,
+        )
+    else:
+        logger.info("Запуск в режиме polling")
+        application.run_polling()
 
 
 if __name__ == "__main__":

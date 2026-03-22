@@ -58,6 +58,18 @@ COOKIES_FILES=/app/cookies/fallback.txt
 - `VK_COOKIES_FILES` — cookies для VK
 - `COOKIES_FILES` (или `COOKIES_FILE`) — общий список (используется как fallback для всех)
 
+### Webhook (опционально вместо polling)
+По умолчанию бот работает через polling. Чтобы включить webhook, задайте:
+```env
+WEBHOOK_URL=https://your-domain.tld
+WEBHOOK_PORT=8080
+WEBHOOK_LISTEN=0.0.0.0
+WEBHOOK_PATH=your-secret-path
+WEBHOOK_SECRET_TOKEN=your-secret-token
+```
+
+Если `WEBHOOK_URL` не задан, бот автоматически запускается в polling-режиме.
+
 ### Кэш
 ```env
 CACHE_TTL_SECONDS=300
