@@ -513,6 +513,7 @@ def _ios_video_filter() -> str:
         f"scale=w='min({IOS_TRANSCODE_MAX_WIDTH},iw)':"
         f"h='min({IOS_TRANSCODE_MAX_HEIGHT},ih)':"
         "force_original_aspect_ratio=decrease,"
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2,"
         f"fps={IOS_TRANSCODE_MAX_FPS}"
     )
 
