@@ -91,9 +91,11 @@ DEFAULT_VIDEO_FORMAT = (
     "bv*+ba/best"
 )
 VIDEO_FORMAT = os.getenv("VIDEO_FORMAT", DEFAULT_VIDEO_FORMAT)
+VIDEO_FORMAT_FALLBACK = os.getenv("VIDEO_FORMAT_FALLBACK", "bestvideo*+bestaudio/best")
 MERGE_OUTPUT_FORMAT = os.getenv("MERGE_OUTPUT_FORMAT", "mp4")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
+AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mka", ".mp3", ".oga", ".ogg", ".opus", ".wav", ".weba"}
 IOS_SAFE_VIDEO_CODEC = "h264"
 IOS_SAFE_AUDIO_CODECS = {"aac"}
 IOS_SAFE_PIXEL_FORMATS = {"yuv420p"}
@@ -463,6 +465,73 @@ def _probe_media(path: Path) -> dict[str, Any] | None:
     return json.loads(result.stdout or "{}")
 
 
+def _collect_downloaded_files(workdir: Path) -> list[Path]:
+    files: list[Path] = []
+    for fp in workdir.glob("*"):
+        if not fp.is_file():
+            continue
+        if fp.name.endswith(".part"):
+            continue
+        if fp.suffix.lower() in {".json", ".description"}:
+            continue
+        files.append(fp)
+
+    files.sort(key=lambda p: p.name)
+    return files
+
+
+def _cleanup_tmp_dir(workdir: Path) -> None:
+    for p in workdir.glob("*"):
+        try:
+            if p.is_file() or p.is_symlink():
+                p.unlink(missing_ok=True)
+            elif p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _stream_kinds_for_file(path: Path) -> tuple[bool, bool]:
+    try:
+        probe = _probe_media(path)
+    except Exception as e:
+        logger.warning("Не удалось определить тип медиа %s: %s", path.name, e)
+        probe = None
+
+    if not probe:
+        ext = path.suffix.lower()
+        return ext in VIDEO_EXTENSIONS, ext in AUDIO_EXTENSIONS
+
+    streams = probe.get("streams") or []
+    has_video = any(s.get("codec_type") == "video" for s in streams)
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    return has_video, has_audio
+
+
+def _select_primary_downloads(files: list[Path]) -> tuple[list[Path], list[Path]]:
+    visual_files: list[Path] = []
+    audio_only_files: list[Path] = []
+    other_files: list[Path] = []
+
+    for path in files:
+        kind = _classify_file(path)
+        if kind == "photo":
+            visual_files.append(path)
+            continue
+
+        has_video, has_audio = _stream_kinds_for_file(path)
+        if has_video:
+            visual_files.append(path)
+        elif has_audio or path.suffix.lower() in AUDIO_EXTENSIONS:
+            audio_only_files.append(path)
+        else:
+            other_files.append(path)
+
+    if visual_files:
+        return visual_files, audio_only_files + other_files
+    return [], audio_only_files + other_files
+
+
 def _needs_ios_video_normalization(path: Path, probe: dict[str, Any]) -> tuple[bool, str]:
     streams = probe.get("streams") or []
     format_info = probe.get("format") or {}
@@ -724,20 +793,18 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
     """Download url into workdir; return cache entry-like dict with files list."""
 
     outtmpl = str(workdir / "%(id)s_%(playlist_index)s.%(ext)s")
-    opts = _ytdlp_common_opts(outtmpl=outtmpl, cookiefile=cookiefile)
+    def _build_opts(fmt: str) -> dict[str, Any]:
+        opts = _ytdlp_common_opts(outtmpl=outtmpl, cookiefile=cookiefile)
+        if site == "instagram":
+            opts["noplaylist"] = False
+            opts["playlistend"] = max(1, min(MAX_ITEMS_PER_LINK, 50))
+        else:
+            opts["noplaylist"] = True
+        opts["format"] = fmt
+        opts["merge_output_format"] = MERGE_OUTPUT_FORMAT
+        return opts
 
-    # site-specific playlist behavior
-    if site == "instagram":
-        opts["noplaylist"] = False
-        opts["playlistend"] = max(1, min(MAX_ITEMS_PER_LINK, 50))
-    else:
-        # keep old behavior: don't accidentally download huge playlists
-        opts["noplaylist"] = True
-
-    # video format selection
-    opts["format"] = VIDEO_FORMAT
-    opts["merge_output_format"] = MERGE_OUTPUT_FORMAT
-
+    opts = _build_opts(VIDEO_FORMAT)
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -766,24 +833,34 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
 
         ydl.download(targets)
 
-    # collect downloaded files
-    all_files: list[Path] = []
-    for fp in workdir.glob("*"):
-        if not fp.is_file():
-            continue
-        # ignore temp/part
-        if fp.name.endswith(".part"):
-            continue
-        if fp.suffix.lower() in {".json", ".description"}:
-            continue
-        all_files.append(fp)
+    all_files = _collect_downloaded_files(workdir)
+    selected_files, dropped_files = _select_primary_downloads(all_files)
+
+    if not selected_files and any(path.suffix.lower() in AUDIO_EXTENSIONS for path in all_files):
+        logger.warning(
+            "[%s] После скачивания остались только аудиофайлы (%s). Повторяю с fallback format.",
+            site,
+            ", ".join(path.name for path in all_files),
+        )
+        _cleanup_tmp_dir(workdir)
+        fallback_opts = _build_opts(VIDEO_FORMAT_FALLBACK)
+        with YoutubeDL(fallback_opts) as ydl:
+            ydl.download(targets)
+        all_files = _collect_downloaded_files(workdir)
+        selected_files, dropped_files = _select_primary_downloads(all_files)
 
     if not all_files:
         raise FileNotFoundError("Не удалось найти скачанные файлы после загрузки.")
+    if not selected_files:
+        raise FileNotFoundError("Скачивание завершилось без фото или видео.")
+    if dropped_files:
+        logger.info(
+            "[%s] Игнорирую побочные файлы после скачивания: %s",
+            site,
+            ", ".join(path.name for path in dropped_files),
+        )
 
-    # sort stable for albums
-    all_files.sort(key=lambda p: p.name)
-    all_files = _normalize_downloaded_files(all_files)
+    selected_files = _normalize_downloaded_files(selected_files)
 
     title = None
     try:
@@ -794,7 +871,7 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
 
     return {
         "title": title,
-        "files": [str(p) for p in all_files],
+        "files": [str(p) for p in selected_files],
     }
 
 
