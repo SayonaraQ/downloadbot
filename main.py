@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,12 @@ from telegram import (
     InputFile,
     InputMediaPhoto,
     InputMediaVideo,
+    InputTextMessageContent,
+    InlineQueryResultArticle,
+    InlineQueryResultCachedAudio,
+    InlineQueryResultCachedDocument,
+    InlineQueryResultCachedPhoto,
+    InlineQueryResultCachedVideo,
     Update,
 )
 from telegram.ext import (
@@ -28,6 +35,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
@@ -44,12 +52,14 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # -------------------------
 # Config
 # -------------------------
 TOKEN = os.getenv("TOKEN") or os.getenv("BOT_TOKEN")
 ADMIN_ID = int((os.getenv("ADMIN_ID") or "0").strip() or "0")
+INLINE_CACHE_CHAT_ID = int((os.getenv("INLINE_CACHE_CHAT_ID") or "0").strip() or "0")
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 USERS_FILE = DATA_DIR / "users.txt"
@@ -1393,6 +1403,232 @@ def _extract_yandex_url(text: str) -> str | None:
     return match.group(0).rstrip(".,!?)];") if match else None
 
 
+async def _get_or_download_media_entry(
+    url: str,
+    *,
+    requester_id: int | None,
+) -> dict[str, Any]:
+    site = _site_for_url(url)
+    key = _cache_key(url)
+
+    entry = _cache_index.get(key)
+    if entry and _cache_entry_is_usable(entry):
+        return entry
+
+    lock = _get_or_create_lock(key)
+    async with lock:
+        entry = _cache_index.get(key)
+        if entry and _cache_entry_is_usable(entry):
+            return entry
+
+        tmp_dir = Path("/tmp") / f"dl_{key[:12]}"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            result = await asyncio.to_thread(
+                download_media_with_fallback,
+                url,
+                tmp_dir,
+                site,
+                requester_id,
+            )
+
+            files = [Path(p) for p in result["files"]]
+            files = files[:max(1, min(MAX_ITEMS_PER_LINK, 10_000))]
+
+            cache_dir = _cache_dir_for_key(key)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            items: list[dict[str, Any]] = []
+            for p in files:
+                kind = _classify_file(p)
+                target = cache_dir / p.name
+                if target.exists():
+                    target = cache_dir / f"{p.stem}_{int(_now())}{p.suffix}"
+                shutil.move(str(p), str(target))
+                items.append({
+                    "kind": kind,
+                    "local_filename": target.name,
+                    "tg_file_id": None,
+                })
+
+            entry = {
+                "key": key,
+                "url": url,
+                "site": site,
+                "title": result.get("title"),
+                "created_at": _now(),
+                "expires_at": _now() + float(CACHE_TTL_SECONDS),
+                "items": items,
+            }
+            _write_cache_entry(entry)
+            return entry
+        except Exception:
+            _purge_cache_entry(key)
+            raise
+        finally:
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+async def _upload_inline_cache_item(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int,
+    kind: str,
+    path: Path,
+) -> str:
+    with path.open("rb") as f:
+        if kind == "photo":
+            msg = await context.bot.send_photo(chat_id=chat_id, photo=f)
+            return msg.photo[-1].file_id
+        if kind == "video":
+            msg = await context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
+            return msg.video.file_id
+        if kind == "audio":
+            msg = await context.bot.send_audio(chat_id=chat_id, audio=f, title=path.stem)
+            return msg.audio.file_id
+        msg = await context.bot.send_document(chat_id=chat_id, document=f)
+        return msg.document.file_id
+
+
+async def _ensure_inline_file_ids(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    entry: dict[str, Any],
+    upload_chat_id: int,
+) -> None:
+    cache_dir = _cache_dir_for_key(str(entry["key"]))
+    changed = False
+
+    for item in entry.get("items") or []:
+        if item.get("tg_file_id"):
+            continue
+        local_filename = item.get("local_filename")
+        if not local_filename:
+            continue
+        path = cache_dir / local_filename
+        if not path.exists() or not path.is_file():
+            continue
+        item["tg_file_id"] = await _upload_inline_cache_item(
+            context,
+            chat_id=upload_chat_id,
+            kind=item.get("kind") or "document",
+            path=path,
+        )
+        changed = True
+
+    if changed:
+        _write_cache_entry(entry)
+
+
+def _inline_article(title: str, message: str) -> InlineQueryResultArticle:
+    return InlineQueryResultArticle(
+        id=str(uuid.uuid4()),
+        title=title,
+        input_message_content=InputTextMessageContent(message),
+    )
+
+
+def _entry_has_inline_file_ids(entry: dict[str, Any]) -> bool:
+    items = entry.get("items") or []
+    return bool(items) and all(item.get("tg_file_id") for item in items)
+
+
+async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    inline_query = update.inline_query
+    if inline_query is None:
+        return
+
+    text = inline_query.query.strip()
+    if not text:
+        await inline_query.answer(
+            [_inline_article("Вставь ссылку", "Напиши: @bot ссылка на Instagram, TikTok, YouTube, VK или Яндекс.Музыку")],
+            cache_time=1,
+            is_personal=True,
+        )
+        return
+
+    upload_chat_id = INLINE_CACHE_CHAT_ID
+    requester_id = inline_query.from_user.id if inline_query.from_user else None
+    yandex_url = _extract_yandex_url(text)
+    video_url = _extract_supported_video_url(text)
+
+    try:
+        if yandex_url:
+            audio_filename = None
+            try:
+                audio_filename = await asyncio.to_thread(download_audio_by_url, yandex_url)
+                path = Path(audio_filename)
+                file_id = await _upload_inline_cache_item(
+                    context,
+                    chat_id=upload_chat_id,
+                    kind="audio",
+                    path=path,
+                )
+                await inline_query.answer(
+                    [InlineQueryResultCachedAudio(id=str(uuid.uuid4()), audio_file_id=file_id)],
+                    cache_time=0,
+                    is_personal=True,
+                )
+            finally:
+                if audio_filename and os.path.exists(audio_filename):
+                    os.remove(audio_filename)
+            return
+
+        if not video_url:
+            await inline_query.answer(
+                [_inline_article("Ссылка не найдена", "Укажи ссылку на Instagram, TikTok, YouTube, VK или Яндекс.Музыку после имени бота.")],
+                cache_time=1,
+                is_personal=True,
+            )
+            return
+
+        entry = await _get_or_download_media_entry(video_url, requester_id=requester_id)
+        if not upload_chat_id and not _entry_has_inline_file_ids(entry):
+            await inline_query.answer(
+                [_inline_article(
+                    "Нужен кэш-чат",
+                    "Для inline-отправки без сообщений в личку настрой INLINE_CACHE_CHAT_ID: создай приватный канал, добавь бота админом и укажи id канала в .env.",
+                )],
+                cache_time=1,
+                is_personal=True,
+            )
+            return
+
+        await _ensure_inline_file_ids(context, entry=entry, upload_chat_id=upload_chat_id)
+
+        results: list[Any] = []
+        for i, item in enumerate(entry.get("items") or [], start=1):
+            file_id = item.get("tg_file_id")
+            if not file_id:
+                continue
+            kind = item.get("kind")
+            result_id = f"{str(entry['key'])[:48]}_{i}"
+            if kind == "photo":
+                results.append(InlineQueryResultCachedPhoto(id=result_id, photo_file_id=file_id))
+            elif kind == "video":
+                results.append(InlineQueryResultCachedVideo(id=result_id, video_file_id=file_id, title="Видео"))
+            else:
+                results.append(InlineQueryResultCachedDocument(id=result_id, document_file_id=file_id, title="Файл"))
+
+        if not results:
+            results = [_inline_article("Не удалось подготовить медиа", "Попробуй отправить ссылку боту напрямую.")]
+
+        await inline_query.answer(results[:50], cache_time=0, is_personal=True)
+    except Exception as e:
+        logger.error("Ошибка inline-запроса: %s", e)
+        await inline_query.answer(
+            [_inline_article("Не удалось загрузить", "Попробуй отправить ссылку боту напрямую или повторить позже.")],
+            cache_time=1,
+            is_personal=True,
+        )
+
+
 async def _get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str | None:
     username = context.bot_data.get("bot_username")
     if isinstance(username, str):
@@ -1468,89 +1704,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # 2) Supported video/media URLs only
         if _looks_like_supported_video_url(text):
             url = text
-            site = _site_for_url(url)
-            key = _cache_key(url)
-
-            # If cached - send immediately
-            entry = _cache_index.get(key)
-            if entry and _cache_entry_is_usable(entry):
-                try:
-                    await send_cache_entry(update, context, entry)
-                    return
-                except Exception as e:
-                    logger.warning(f"Кэш найден, но отправка не удалась (будет перезакачка): {e}")
-                    _purge_cache_entry(key)
-
-            lock = _get_or_create_lock(key)
-            async with lock:
-                # re-check after lock
-                entry = _cache_index.get(key)
-                if entry and _cache_entry_is_usable(entry):
-                    await send_cache_entry(update, context, entry)
-                    return
-
-                tmp_dir = Path("/tmp") / f"dl_{key[:12]}"
-                if tmp_dir.exists():
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                tmp_dir.mkdir(parents=True, exist_ok=True)
-
-                try:
-                    result = await asyncio.to_thread(
-                        download_media_with_fallback,
-                        url,
-                        tmp_dir,
-                        site,
-                        requester_id,
-                    )
-
-                    files = [Path(p) for p in result["files"]]
-                    # Apply MAX_ITEMS_PER_LINK also post-download (safety)
-                    files = files[:max(1, min(MAX_ITEMS_PER_LINK, 10_000))]
-
-                    cache_dir = _cache_dir_for_key(key)
-                    cache_dir.mkdir(parents=True, exist_ok=True)
-
-                    items: list[dict[str, Any]] = []
-                    for p in files:
-                        kind = _classify_file(p)
-                        # Put into cache folder
-                        target = cache_dir / p.name
-                        if target.exists():
-                            # avoid collisions
-                            target = cache_dir / f"{p.stem}_{int(_now())}{p.suffix}"
-                        shutil.move(str(p), str(target))
-                        items.append({
-                            "kind": kind,
-                            "local_filename": target.name,
-                            "tg_file_id": None,
-                        })
-
-                    entry = {
-                        "key": key,
-                        "url": url,
-                        "site": site,
-                        "title": result.get("title"),
-                        "created_at": _now(),
-                        "expires_at": _now() + float(CACHE_TTL_SECONDS),
-                        "items": items,
-                    }
-                    _write_cache_entry(entry)
-
-                    await send_cache_entry(update, context, entry)
-
-                except ValueError as e:
-                    await update.message.reply_text(str(e))
-                except Exception as e:
-                    logger.error(f"Ошибка: {e}")
-                    await update.message.reply_text(
-                        "Не удалось загрузить. Возможно пора обновить cookies"
-                    )
-                    _purge_cache_entry(key)
-                finally:
-                    try:
-                        shutil.rmtree(tmp_dir, ignore_errors=True)
-                    except Exception:
-                        pass
+            try:
+                entry = await _get_or_download_media_entry(url, requester_id=requester_id)
+                await send_cache_entry(update, context, entry)
+            except ValueError as e:
+                await update.message.reply_text(str(e))
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                await update.message.reply_text(
+                    "Не удалось загрузить. Возможно пора обновить cookies"
+                )
             return
 
         # 3) Music by query
@@ -1584,6 +1747,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("pechenyuha", pechenyuha_command))
     app.add_handler(CommandHandler("users", get_users_count))
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(InlineQueryHandler(handle_inline_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_cookie_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
