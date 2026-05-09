@@ -1615,6 +1615,28 @@ def _start_inline_prepare_task(
     return True
 
 
+async def _wait_for_inline_ready(key: str, *, timeout_seconds: float = 10.0) -> dict[str, Any] | None:
+    deadline = _now() + timeout_seconds
+    while _now() < deadline:
+        entry = _cache_index.get(key)
+        if entry and _cache_entry_is_usable(entry) and _entry_has_inline_file_ids(entry):
+            return entry
+
+        task = _inline_prepare_tasks.get(key)
+        if task and task.done():
+            entry = _cache_index.get(key)
+            if entry and _cache_entry_is_usable(entry) and _entry_has_inline_file_ids(entry):
+                return entry
+            return None
+
+        await asyncio.sleep(0.5)
+
+    entry = _cache_index.get(key)
+    if entry and _cache_entry_is_usable(entry) and _entry_has_inline_file_ids(entry):
+        return entry
+    return None
+
+
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     inline_query = update.inline_query
     if inline_query is None:
@@ -1688,9 +1710,16 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             requester_id=requester_id,
             upload_chat_id=upload_chat_id,
         )
+
+        ready_entry = await _wait_for_inline_ready(key, timeout_seconds=10.0)
+        if ready_entry:
+            results = _build_inline_media_results(ready_entry)
+            await inline_query.answer(results[:50], cache_time=0, is_personal=True)
+            return
+
         title = "Готовлю видео" if started else "Видео ещё готовится"
         await inline_query.answer(
-            [_inline_article(title, "Видео готовится. Через несколько секунд снова введи эту же ссылку через @бота и выбери готовый результат.")],
+            [_inline_article(title, "Видео готовится. Повтори этот же inline-запрос через 10 секунд: @бот ссылка.")],
             cache_time=1,
             is_personal=True,
         )
