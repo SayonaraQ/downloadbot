@@ -131,9 +131,14 @@ INSTAGRAM_RE = re.compile(r"^\s*https?://(?:(?:www|m)\.)?instagram\.com/\S+\s*$"
 TIKTOK_RE = re.compile(r"^\s*(?:https?://(?:(?:www)\.)?tiktok\.com/\S+|https?://vt\.tiktok\.com/\S+)\s*$", re.I)
 YOUTUBE_RE = re.compile(r"^\s*(?:https?://(?:(?:www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+)\s*$", re.I)
 VK_RE = re.compile(r"^\s*(?:https?://(?:(?:www)\.)?vk\.com/\S+|https?://vk\.cc/\S+|https?://vkvideo\.ru/\S+)\s*$", re.I)
+SUPPORTED_VIDEO_URL_RE = re.compile(
+    r"https?://(?:(?:(?:www|m)\.)?instagram\.com|(?:(?:www)\.)?tiktok\.com|vt\.tiktok\.com|(?:(?:www|m)\.)?youtube\.com|youtu\.be|(?:(?:www)\.)?vk\.com|vk\.cc|vkvideo\.ru)/\S+",
+    re.I,
+)
 
 # Yandex Music support (existing feature)
 YANDEX_URL_RE = re.compile(r"https?://(?:(?:www|m)\.)?music\.yandex\.(?:ru|by|kz|ua)/", re.I)
+YANDEX_FULL_URL_RE = re.compile(r"https?://(?:(?:www|m)\.)?music\.yandex\.(?:ru|by|kz|ua)/\S+", re.I)
 
 # Simple music query: "Artist - Title" (existing behavior)
 MUSIC_PATTERN = re.compile(r"^(\w{2,}(\s+\w{2,}){0,3})\s+-\s+(\w{2,}(\s+\w{2,}){0,3})$")
@@ -1378,12 +1383,53 @@ def _looks_like_supported_video_url(text: str) -> bool:
     return bool(INSTAGRAM_RE.match(text) or TIKTOK_RE.match(text) or YOUTUBE_RE.match(text) or VK_RE.match(text))
 
 
+def _extract_supported_video_url(text: str) -> str | None:
+    match = SUPPORTED_VIDEO_URL_RE.search(text)
+    return match.group(0).rstrip(".,!?)];") if match else None
+
+
+def _extract_yandex_url(text: str) -> str | None:
+    match = YANDEX_FULL_URL_RE.search(text)
+    return match.group(0).rstrip(".,!?)];") if match else None
+
+
+async def _get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    username = context.bot_data.get("bot_username")
+    if isinstance(username, str):
+        return username
+
+    me = await context.bot.get_me()
+    username = me.username.lower() if me.username else None
+    context.bot_data["bot_username"] = username
+    return username
+
+
+async def _normalize_mention_text(text: str, context: ContextTypes.DEFAULT_TYPE) -> tuple[str, bool]:
+    username = await _get_bot_username(context)
+    if not username:
+        return text.strip(), False
+
+    mention_re = re.compile(rf"(?<!\w)@{re.escape(username)}(?!\w)", re.I)
+    cleaned, count = mention_re.subn(" ", text)
+    return re.sub(r"\s+", " ", cleaned).strip(), count > 0
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает сообщения, сохраняет chat_id и загружает видео/медиа или музыку."""
     if update.message is None or update.message.text is None:
         return
 
-    text = update.message.text.strip()
+    text, was_mentioned = await _normalize_mention_text(update.message.text, context)
+    if not text:
+        await update.message.reply_text(
+            "Пришли после упоминания ссылку на Instagram, TikTok, YouTube, VK или запрос музыки в формате `Исполнитель - Название`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if was_mentioned:
+        text = _extract_yandex_url(text) or _extract_supported_video_url(text) or text
+
     chat_id = update.message.chat_id
     requester_id = update.effective_user.id if update.effective_user else None
 
