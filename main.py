@@ -1482,19 +1482,35 @@ async def _upload_inline_cache_item(
     chat_id: int,
     kind: str,
     path: Path,
-) -> str:
+) -> tuple[str, str]:
+    upload_kwargs = {
+        "connect_timeout": 30,
+        "read_timeout": 300,
+        "write_timeout": 300,
+        "pool_timeout": 30,
+    }
+    logger.info("Загружаю inline-кэш %s (%s, %.1f MB)", path.name, kind, path.stat().st_size / 1024 / 1024)
     with path.open("rb") as f:
         if kind == "photo":
-            msg = await context.bot.send_photo(chat_id=chat_id, photo=f)
-            return msg.photo[-1].file_id
+            msg = await context.bot.send_photo(chat_id=chat_id, photo=f, **upload_kwargs)
+            return msg.photo[-1].file_id, "photo"
         if kind == "video":
-            msg = await context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
-            return msg.video.file_id
+            try:
+                msg = await asyncio.wait_for(
+                    context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True, **upload_kwargs),
+                    timeout=90,
+                )
+                return msg.video.file_id, "video"
+            except Exception as e:
+                logger.warning("send_video для inline-кэша не удался (%s). Загружаю как документ.", e)
+                f.seek(0)
+                msg = await context.bot.send_document(chat_id=chat_id, document=f, **upload_kwargs)
+                return msg.document.file_id, "document"
         if kind == "audio":
-            msg = await context.bot.send_audio(chat_id=chat_id, audio=f, title=path.stem)
-            return msg.audio.file_id
-        msg = await context.bot.send_document(chat_id=chat_id, document=f)
-        return msg.document.file_id
+            msg = await context.bot.send_audio(chat_id=chat_id, audio=f, title=path.stem, **upload_kwargs)
+            return msg.audio.file_id, "audio"
+        msg = await context.bot.send_document(chat_id=chat_id, document=f, **upload_kwargs)
+        return msg.document.file_id, "document"
 
 
 async def _ensure_inline_file_ids(
@@ -1515,12 +1531,14 @@ async def _ensure_inline_file_ids(
         path = cache_dir / local_filename
         if not path.exists() or not path.is_file():
             continue
-        item["tg_file_id"] = await _upload_inline_cache_item(
+        file_id, inline_kind = await _upload_inline_cache_item(
             context,
             chat_id=upload_chat_id,
             kind=item.get("kind") or "document",
             path=path,
         )
+        item["tg_file_id"] = file_id
+        item["inline_kind"] = inline_kind
         changed = True
 
     if changed:
@@ -1546,7 +1564,7 @@ def _build_inline_media_results(entry: dict[str, Any]) -> list[Any]:
         file_id = item.get("tg_file_id")
         if not file_id:
             continue
-        kind = item.get("kind")
+            kind = item.get("inline_kind") or item.get("kind")
         result_id = f"{str(entry['key'])[:48]}_{i}"
         if kind == "photo":
             results.append(InlineQueryResultCachedPhoto(id=result_id, photo_file_id=file_id))
@@ -1622,7 +1640,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             try:
                 audio_filename = await asyncio.to_thread(download_audio_by_url, yandex_url)
                 path = Path(audio_filename)
-                file_id = await _upload_inline_cache_item(
+                file_id, _inline_kind = await _upload_inline_cache_item(
                     context,
                     chat_id=upload_chat_id,
                     kind="audio",
