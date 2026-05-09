@@ -102,6 +102,15 @@ DEFAULT_VIDEO_FORMAT = (
 )
 VIDEO_FORMAT = os.getenv("VIDEO_FORMAT", DEFAULT_VIDEO_FORMAT)
 VIDEO_FORMAT_FALLBACK = os.getenv("VIDEO_FORMAT_FALLBACK", "bestvideo*+bestaudio/best")
+DEFAULT_INLINE_VIDEO_FORMAT = (
+    "bestvideo[height<=480][vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
+    "best[height<=480][vcodec^=avc1][ext=mp4]/"
+    "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
+    "best[height<=480][ext=mp4]/"
+    "best[height<=480]/best"
+)
+INLINE_VIDEO_FORMAT = os.getenv("INLINE_VIDEO_FORMAT", DEFAULT_INLINE_VIDEO_FORMAT)
+INLINE_VIDEO_FORMAT_FALLBACK = os.getenv("INLINE_VIDEO_FORMAT_FALLBACK", "best[height<=480]/best")
 MERGE_OUTPUT_FORMAT = os.getenv("MERGE_OUTPUT_FORMAT", "mp4")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
@@ -313,6 +322,12 @@ def _cookie_files_for_site(site: str, preferred_user_id: int | None = None) -> l
 
 def _cache_key(url: str) -> str:
     return hashlib.sha256(url.strip().encode("utf-8")).hexdigest()
+
+
+def _cache_key_for_variant(url: str, variant: str | None = None) -> str:
+    if not variant:
+        return _cache_key(url)
+    return _cache_key(f"{variant}:{url}")
 
 
 def _cache_dir_for_key(key: str) -> Path:
@@ -805,7 +820,15 @@ def _check_duration_limit(info: Any) -> None:
             )
 
 
-def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | None, site: str) -> dict[str, Any]:
+def _download_media_with_cookie(
+    url: str,
+    workdir: Path,
+    *,
+    cookiefile: str | None,
+    site: str,
+    video_format: str = VIDEO_FORMAT,
+    video_format_fallback: str = VIDEO_FORMAT_FALLBACK,
+) -> dict[str, Any]:
     """Download url into workdir; return cache entry-like dict with files list."""
 
     outtmpl = str(workdir / "%(id)s_%(playlist_index)s.%(ext)s")
@@ -820,7 +843,7 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
         opts["merge_output_format"] = MERGE_OUTPUT_FORMAT
         return opts
 
-    opts = _build_opts(VIDEO_FORMAT)
+    opts = _build_opts(video_format)
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -859,7 +882,7 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
             ", ".join(path.name for path in all_files),
         )
         _cleanup_tmp_dir(workdir)
-        fallback_opts = _build_opts(VIDEO_FORMAT_FALLBACK)
+        fallback_opts = _build_opts(video_format_fallback)
         with YoutubeDL(fallback_opts) as ydl:
             ydl.download(targets)
         all_files = _collect_downloaded_files(workdir)
@@ -896,6 +919,8 @@ def download_media_with_fallback(
     tmp_dir: Path,
     site: str,
     preferred_user_id: int | None = None,
+    video_format: str = VIDEO_FORMAT,
+    video_format_fallback: str = VIDEO_FORMAT_FALLBACK,
 ) -> dict[str, Any]:
     """Try to download using no cookies (optional) and then multiple cookie files."""
     cookie_files = _cookie_files_for_site(site, preferred_user_id=preferred_user_id)
@@ -922,7 +947,14 @@ def download_media_with_fallback(
             logger.info(
                 f"[{site}] Попытка {idx}/{len(attempts)} скачать URL. cookies={'нет' if not cookiefile else cookiefile}"
             )
-            return _download_media_with_cookie(url, tmp_dir, cookiefile=cookiefile, site=site)
+            return _download_media_with_cookie(
+                url,
+                tmp_dir,
+                cookiefile=cookiefile,
+                site=site,
+                video_format=video_format,
+                video_format_fallback=video_format_fallback,
+            )
         except DownloadError as e:
             last_err = e
             last_err_text = str(e)
@@ -1408,9 +1440,12 @@ async def _get_or_download_media_entry(
     url: str,
     *,
     requester_id: int | None,
+    cache_variant: str | None = None,
+    video_format: str = VIDEO_FORMAT,
+    video_format_fallback: str = VIDEO_FORMAT_FALLBACK,
 ) -> dict[str, Any]:
     site = _site_for_url(url)
-    key = _cache_key(url)
+    key = _cache_key_for_variant(url, cache_variant)
 
     entry = _cache_index.get(key)
     if entry and _cache_entry_is_usable(entry):
@@ -1434,6 +1469,8 @@ async def _get_or_download_media_entry(
                 tmp_dir,
                 site,
                 requester_id,
+                video_format,
+                video_format_fallback,
             )
 
             files = [Path(p) for p in result["files"]]
@@ -1582,7 +1619,13 @@ async def _prepare_inline_media(
     requester_id: int | None,
     upload_chat_id: int,
 ) -> None:
-    entry = await _get_or_download_media_entry(url, requester_id=requester_id)
+    entry = await _get_or_download_media_entry(
+        url,
+        requester_id=requester_id,
+        cache_variant="inline",
+        video_format=INLINE_VIDEO_FORMAT,
+        video_format_fallback=INLINE_VIDEO_FORMAT_FALLBACK,
+    )
     await _ensure_inline_file_ids(context, entry=entry, upload_chat_id=upload_chat_id)
 
 
@@ -1593,7 +1636,7 @@ def _start_inline_prepare_task(
     requester_id: int | None,
     upload_chat_id: int,
 ) -> bool:
-    key = _cache_key(url)
+    key = _cache_key_for_variant(url, "inline")
     task = _inline_prepare_tasks.get(key)
     if task and not task.done():
         return False
@@ -1686,7 +1729,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        key = _cache_key(video_url)
+        key = _cache_key_for_variant(video_url, "inline")
         entry = _cache_index.get(key)
         if entry and _cache_entry_is_usable(entry) and _entry_has_inline_file_ids(entry):
             results = _build_inline_media_results(entry)
