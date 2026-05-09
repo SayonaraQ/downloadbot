@@ -130,6 +130,7 @@ ios_transcode_sema = threading.Semaphore(IOS_TRANSCODE_MAX_PARALLEL)
 
 # Per-URL locks to avoid duplicate downloads
 _cache_locks: dict[str, asyncio.Lock] = {}
+_inline_prepare_tasks: dict[str, asyncio.Task[None]] = {}
 
 # In-memory cache index (also persisted in meta.json)
 _cache_index: dict[str, dict[str, Any]] = {}
@@ -1539,6 +1540,63 @@ def _entry_has_inline_file_ids(entry: dict[str, Any]) -> bool:
     return bool(items) and all(item.get("tg_file_id") for item in items)
 
 
+def _build_inline_media_results(entry: dict[str, Any]) -> list[Any]:
+    results: list[Any] = []
+    for i, item in enumerate(entry.get("items") or [], start=1):
+        file_id = item.get("tg_file_id")
+        if not file_id:
+            continue
+        kind = item.get("kind")
+        result_id = f"{str(entry['key'])[:48]}_{i}"
+        if kind == "photo":
+            results.append(InlineQueryResultCachedPhoto(id=result_id, photo_file_id=file_id))
+        elif kind == "video":
+            results.append(InlineQueryResultCachedVideo(id=result_id, video_file_id=file_id, title="Видео"))
+        else:
+            results.append(InlineQueryResultCachedDocument(id=result_id, document_file_id=file_id, title="Файл"))
+    return results
+
+
+async def _prepare_inline_media(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    url: str,
+    requester_id: int | None,
+    upload_chat_id: int,
+) -> None:
+    entry = await _get_or_download_media_entry(url, requester_id=requester_id)
+    await _ensure_inline_file_ids(context, entry=entry, upload_chat_id=upload_chat_id)
+
+
+def _start_inline_prepare_task(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    url: str,
+    requester_id: int | None,
+    upload_chat_id: int,
+) -> bool:
+    key = _cache_key(url)
+    task = _inline_prepare_tasks.get(key)
+    if task and not task.done():
+        return False
+
+    async def _runner() -> None:
+        try:
+            await _prepare_inline_media(
+                context,
+                url=url,
+                requester_id=requester_id,
+                upload_chat_id=upload_chat_id,
+            )
+        except Exception as e:
+            logger.error("Ошибка фоновой подготовки inline-медиа: %s", e)
+        finally:
+            _inline_prepare_tasks.pop(key, None)
+
+    _inline_prepare_tasks[key] = asyncio.create_task(_runner())
+    return True
+
+
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     inline_query = update.inline_query
     if inline_query is None:
@@ -1588,8 +1646,14 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        entry = await _get_or_download_media_entry(video_url, requester_id=requester_id)
-        if not upload_chat_id and not _entry_has_inline_file_ids(entry):
+        key = _cache_key(video_url)
+        entry = _cache_index.get(key)
+        if entry and _cache_entry_is_usable(entry) and _entry_has_inline_file_ids(entry):
+            results = _build_inline_media_results(entry)
+            await inline_query.answer(results[:50], cache_time=0, is_personal=True)
+            return
+
+        if not upload_chat_id:
             await inline_query.answer(
                 [_inline_article(
                     "Нужен кэш-чат",
@@ -1600,26 +1664,18 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        await _ensure_inline_file_ids(context, entry=entry, upload_chat_id=upload_chat_id)
-
-        results: list[Any] = []
-        for i, item in enumerate(entry.get("items") or [], start=1):
-            file_id = item.get("tg_file_id")
-            if not file_id:
-                continue
-            kind = item.get("kind")
-            result_id = f"{str(entry['key'])[:48]}_{i}"
-            if kind == "photo":
-                results.append(InlineQueryResultCachedPhoto(id=result_id, photo_file_id=file_id))
-            elif kind == "video":
-                results.append(InlineQueryResultCachedVideo(id=result_id, video_file_id=file_id, title="Видео"))
-            else:
-                results.append(InlineQueryResultCachedDocument(id=result_id, document_file_id=file_id, title="Файл"))
-
-        if not results:
-            results = [_inline_article("Не удалось подготовить медиа", "Попробуй отправить ссылку боту напрямую.")]
-
-        await inline_query.answer(results[:50], cache_time=0, is_personal=True)
+        started = _start_inline_prepare_task(
+            context,
+            url=video_url,
+            requester_id=requester_id,
+            upload_chat_id=upload_chat_id,
+        )
+        title = "Готовлю видео" if started else "Видео ещё готовится"
+        await inline_query.answer(
+            [_inline_article(title, "Видео готовится. Через несколько секунд снова введи эту же ссылку через @бота и выбери готовый результат.")],
+            cache_time=1,
+            is_personal=True,
+        )
     except Exception as e:
         logger.error("Ошибка inline-запроса: %s", e)
         await inline_query.answer(
@@ -1742,7 +1798,14 @@ def build_application() -> Application:
     if not TOKEN:
         raise RuntimeError("Не найден TOKEN (или BOT_TOKEN) в .env")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .connect_timeout(30)
+        .read_timeout(120)
+        .write_timeout(120)
+        .build()
+    )
 
     app.add_handler(CommandHandler("pechenyuha", pechenyuha_command))
     app.add_handler(CommandHandler("users", get_users_count))
