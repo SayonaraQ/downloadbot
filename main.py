@@ -55,6 +55,43 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+
+def _patch_ytdlp_yandex_music_https() -> None:
+    """Yandex Music sometimes returns protocol-relative URLs that yt-dlp opens as HTTP."""
+    try:
+        from yt_dlp.extractor import yandexmusic as yandexmusic_ie
+    except Exception as e:
+        logger.warning("Не удалось применить HTTPS patch для Yandex Music yt-dlp extractor: %s", e)
+        return
+
+    base_ie = getattr(yandexmusic_ie, "YandexMusicBaseIE", None)
+    track_ie = getattr(yandexmusic_ie, "YandexMusicTrackIE", None)
+    if not base_ie or not track_ie or getattr(base_ie, "_downloadbot_https_patch", False):
+        return
+
+    original_download_json = base_ie._download_json
+    original_real_extract = track_ie._real_extract
+
+    def download_json_https(self, url_or_request, *args, **kwargs):
+        if isinstance(url_or_request, str) and url_or_request.startswith("//api.music.yandex.net/"):
+            url_or_request = f"https:{url_or_request}"
+        return original_download_json(self, url_or_request, *args, **kwargs)
+
+    def real_extract_https(self, url):
+        info = original_real_extract(self, url)
+        if isinstance(info, dict):
+            media_url = info.get("url")
+            if isinstance(media_url, str) and media_url.startswith("http://"):
+                info["url"] = f"https://{media_url[len('http://'):]}"
+        return info
+
+    base_ie._download_json = download_json_https
+    track_ie._real_extract = real_extract_https
+    base_ie._downloadbot_https_patch = True
+
+
+_patch_ytdlp_yandex_music_https()
+
 # -------------------------
 # Config
 # -------------------------
