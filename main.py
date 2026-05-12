@@ -1,5 +1,4 @@
 import asyncio
-import glob
 import hashlib
 import http.cookiejar as cookiejar
 import json
@@ -12,7 +11,6 @@ import threading
 import time
 import uuid
 from contextlib import ExitStack
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -20,6 +18,8 @@ import requests
 from dotenv import load_dotenv
 from telegram import (
     InputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     InputMediaPhoto,
     InputMediaVideo,
     InputTextMessageContent,
@@ -37,6 +37,7 @@ from telegram.ext import (
     ContextTypes,
     InlineQueryHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 from yt_dlp import YoutubeDL
@@ -88,8 +89,15 @@ MAX_ITEMS_PER_LINK = int(os.getenv("MAX_ITEMS_PER_LINK", "10"))
 TRY_NO_COOKIES_FIRST = (os.getenv("TRY_NO_COOKIES_FIRST", "1").strip() != "0")
 
 # Network / special cases
-RU_PROXY = os.getenv("RU_PROXY")
-YA_COOKIES_FILE = os.getenv("YA_COOKIES_FILE")
+RU_PROXY = (os.getenv("RU_PROXY") or "").strip() or None
+YA_PROXY = (os.getenv("YA_PROXY") or os.getenv("YANDEX_MUSIC_PROXY") or RU_PROXY or "").strip() or None
+YA_COOKIES_FILES = os.getenv("YA_COOKIES_FILES") or os.getenv("YA_COOKIES_FILE")
+
+# Audio extraction
+AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "bestaudio/best")
+AUDIO_CODEC = os.getenv("AUDIO_CODEC", "mp3").strip() or "mp3"
+AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "192").strip() or "192"
+AUDIO_SEARCH_PREFIX = os.getenv("AUDIO_SEARCH_PREFIX", "ytsearch1").strip() or "ytsearch1"
 
 # Format selection (yt-dlp)
 DEFAULT_VIDEO_FORMAT = (
@@ -123,6 +131,7 @@ IG_COOKIES_FILES = os.getenv("IG_COOKIES_FILES") or os.getenv("IG_COOKIES_FILE")
 YT_COOKIES_FILES = os.getenv("YT_COOKIES_FILES") or os.getenv("YT_COOKIES_FILE")
 TT_COOKIES_FILES = os.getenv("TT_COOKIES_FILES") or os.getenv("TT_COOKIES_FILE")
 VK_COOKIES_FILES = os.getenv("VK_COOKIES_FILES") or os.getenv("VK_COOKIES_FILE")
+SC_COOKIES_FILES = os.getenv("SC_COOKIES_FILES") or os.getenv("SC_COOKIES_FILE")
 
 # Semaphore to limit parallel downloads
 sema = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -134,6 +143,10 @@ _cache_locks: dict[str, asyncio.Lock] = {}
 # In-memory cache index (also persisted in meta.json)
 _cache_index: dict[str, dict[str, Any]] = {}
 
+# Inline cache warm-up tasks. Inline answers must be fast, so expensive downloads
+# are prepared in the background and served from Telegram file_id on the next query.
+_inline_prepare_tasks: set[str] = set()
+
 # -------------------------
 # URL patterns (keep strict behaviour: react only to supported domains)
 # -------------------------
@@ -141,6 +154,7 @@ INSTAGRAM_RE = re.compile(r"^\s*https?://(?:(?:www|m)\.)?instagram\.com/\S+\s*$"
 TIKTOK_RE = re.compile(r"^\s*(?:https?://(?:(?:www)\.)?tiktok\.com/\S+|https?://vt\.tiktok\.com/\S+)\s*$", re.I)
 YOUTUBE_RE = re.compile(r"^\s*(?:https?://(?:(?:www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+)\s*$", re.I)
 VK_RE = re.compile(r"^\s*(?:https?://(?:(?:www)\.)?vk\.com/\S+|https?://vk\.cc/\S+|https?://vkvideo\.ru/\S+)\s*$", re.I)
+SOUNDCLOUD_RE = re.compile(r"^\s*(?:https?://(?:(?:www|m)\.)?soundcloud\.com/\S+|https?://on\.soundcloud\.com/\S+)\s*$", re.I)
 SUPPORTED_VIDEO_URL_RE = re.compile(
     r"https?://(?:(?:(?:www|m)\.)?instagram\.com|(?:(?:www)\.)?tiktok\.com|vt\.tiktok\.com|(?:(?:www|m)\.)?youtube\.com|youtu\.be|(?:(?:www)\.)?vk\.com|vk\.cc|vkvideo\.ru)/\S+",
     re.I,
@@ -149,6 +163,11 @@ SUPPORTED_VIDEO_URL_RE = re.compile(
 # Yandex Music support (existing feature)
 YANDEX_URL_RE = re.compile(r"https?://(?:(?:www|m)\.)?music\.yandex\.(?:ru|by|kz|ua)/", re.I)
 YANDEX_FULL_URL_RE = re.compile(r"https?://(?:(?:www|m)\.)?music\.yandex\.(?:ru|by|kz|ua)/\S+", re.I)
+SOUNDCLOUD_FULL_URL_RE = re.compile(r"https?://(?:(?:www|m)\.)?soundcloud\.com/\S+|https?://on\.soundcloud\.com/\S+", re.I)
+SUPPORTED_AUDIO_URL_RE = re.compile(
+    r"https?://(?:(?:(?:www|m)\.)?music\.yandex\.(?:ru|by|kz|ua)|(?:(?:www|m)\.)?soundcloud\.com|on\.soundcloud\.com|(?:(?:www|m)\.)?youtube\.com|youtu\.be)/\S+",
+    re.I,
+)
 
 # Simple music query: "Artist - Title" (existing behavior)
 MUSIC_PATTERN = re.compile(r"^(\w{2,}(\s+\w{2,}){0,3})\s+-\s+(\w{2,}(\s+\w{2,}){0,3})$")
@@ -967,6 +986,9 @@ async def _send_single_item(
         if kind == "video":
             msg = await context.bot.send_video(chat_id=chat_id, video=media, caption=caption, parse_mode=parse_mode, supports_streaming=True)
             return msg.video.file_id
+        if kind == "audio":
+            msg = await context.bot.send_audio(chat_id=chat_id, audio=media, caption=caption, parse_mode=parse_mode)
+            return msg.audio.file_id
         msg = await context.bot.send_document(chat_id=chat_id, document=media, caption=caption, parse_mode=parse_mode)
         return msg.document.file_id
 
@@ -979,6 +1001,9 @@ async def _send_single_item(
         if kind == "video":
             msg = await update.message.reply_video(video=f, caption=caption, parse_mode=parse_mode, supports_streaming=True)
             return msg.video.file_id
+        if kind == "audio":
+            msg = await update.message.reply_audio(audio=f, caption=caption, parse_mode=parse_mode, title=media_path.stem)
+            return msg.audio.file_id
         msg = await update.message.reply_document(document=f, caption=caption, parse_mode=parse_mode)
         return msg.document.file_id
 
@@ -1159,124 +1184,312 @@ async def send_cache_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, e
 
 
 # -------------------------
-# Existing music features
+# Music / audio downloads
 # -------------------------
 
-def download_music(query: str) -> str:
-    """Скачивает музыку и конвертирует в MP3 (поиск на YouTube)."""
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": "%(title)s.%(ext)s",
-        "quiet": True,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
+def _extract_audio_url(text: str) -> str | None:
+    match = SUPPORTED_AUDIO_URL_RE.search(text)
+    return match.group(0).rstrip(".,!?)];") if match else None
+
+
+def _looks_like_url(text: str) -> bool:
+    return bool(re.match(r"^\s*https?://", text, re.I))
+
+
+def _audio_site_for_url(url: str) -> str:
+    if YANDEX_URL_RE.search(url):
+        return "yandex_music"
+    if SOUNDCLOUD_RE.match(url) or SOUNDCLOUD_FULL_URL_RE.search(url):
+        return "soundcloud"
+    if YOUTUBE_RE.match(url):
+        return "youtube"
+    return "unknown"
+
+
+def _proxy_for_audio_site(site: str) -> str | None:
+    if site == "yandex_music":
+        return YA_PROXY
+    return None
+
+
+def _cookie_files_for_audio_site(site: str) -> list[str]:
+    site_map = {
+        "yandex_music": _parse_cookie_files(YA_COOKIES_FILES),
+        "youtube": _parse_cookie_files(YT_COOKIES_FILES),
+        "youtube_search": _parse_cookie_files(YT_COOKIES_FILES),
+        "soundcloud": _parse_cookie_files(SC_COOKIES_FILES),
     }
-    with YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(f"ytsearch:{query}", download=True)
-        if not info_dict.get("entries"):
-            raise Exception("Ничего не найдено")
-        audio_filename = ydl.prepare_filename(info_dict["entries"][0])
-        audio_filename = audio_filename.replace(".webm", ".mp3").replace(".m4a", ".mp3")
-        return audio_filename
+    result = site_map.get(site, [])
+    result += _parse_cookie_files(COOKIES_FILES)
+
+    out: list[str] = []
+    seen = set()
+    for x in result:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
 
 
-def download_audio_by_url(url: str) -> str:
-    """Скачивает аудио по ссылке (Яндекс.Музыка поддерживается через proxy+cookies)."""
+def _normalize_yandex_music_url(url: str, *, cookiefile: str | None, proxy: str | None) -> str:
+    """Best-effort conversion of /track/<id> URLs to /album/<id>/track/<id>."""
+    if not YANDEX_URL_RE.search(url):
+        return url
+    if "/track/" not in url or "/album/" in url:
+        return url
 
-    is_yandex = bool(YANDEX_URL_RE.search(url))
+    try:
+        sess = requests.Session()
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://music.yandex.ru/",
+        }
+        proxies = {"http": proxy, "https": proxy} if proxy else None
 
-    cookiefile = None
-    proxy = None
+        if cookiefile and os.path.exists(cookiefile):
+            cj = cookiejar.MozillaCookieJar()
+            cj.load(cookiefile, ignore_expires=True, ignore_discard=True)
+            sess.cookies = cj
 
-    if is_yandex:
-        cookiefile = YA_COOKIES_FILE
-        proxy = RU_PROXY
-
-    # Нормализация: /track/<id> -> /album/<album_id>/track/<id>
-    if is_yandex and "/track/" in url and "/album/" not in url:
-        try:
-            sess = requests.Session()
-            headers = {
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://music.yandex.ru/",
-            }
-            proxies = {"http": proxy, "https": proxy} if proxy else None
-
-            if cookiefile and os.path.exists(cookiefile):
-                cj = cookiejar.MozillaCookieJar()
-                cj.load(cookiefile, ignore_expires=True, ignore_discard=True)
-                sess.cookies = cj
-
-            html = sess.get(url, headers=headers, proxies=proxies, timeout=15).text
-
-            # og:url
-            m = re.search(
-                r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
-                html,
-                re.I,
-            )
+        html = sess.get(url, headers=headers, proxies=proxies, timeout=15).text
+        patterns = [
+            r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
+            r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, html, re.I)
             if m:
-                url = m.group(1)
-            else:
-                # canonical
-                m = re.search(
-                    r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
-                    html,
-                    re.I,
-                )
-                if m:
-                    url = m.group(1)
-        except Exception:
-            pass
+                return m.group(1)
+    except Exception as e:
+        logger.warning("Не удалось нормализовать ссылку Яндекс.Музыки: %s", e)
 
-    # Одиночный трек — без плейлиста; альбом/плейлист — разрешаем плейлист
-    noplaylist = "/track/" in url
+    return url
 
-    ydl_opts = _ytdlp_common_opts(outtmpl="%(title)s.%(ext)s", proxy=proxy, cookiefile=cookiefile)
-    ydl_opts.update({
-        "format": "bestaudio/best",
+
+def _audio_noplaylist(site: str, url: str | None) -> bool:
+    if not url:
+        return True
+    if site == "yandex_music":
+        return "/track/" in url
+    if site == "soundcloud":
+        return "/sets/" not in url
+    return True
+
+
+def _audio_entries_from_info(info: Any) -> list[dict[str, Any]]:
+    return [entry for entry in _iter_entries(info) if isinstance(entry, dict)]
+
+
+def _select_audio_downloads(files: list[Path]) -> list[Path]:
+    audio_files: list[Path] = []
+    other_files: list[Path] = []
+
+    for path in files:
+        has_video, has_audio = _stream_kinds_for_file(path)
+        if has_audio and not has_video:
+            audio_files.append(path)
+        elif path.suffix.lower() in AUDIO_EXTENSIONS:
+            audio_files.append(path)
+        else:
+            other_files.append(path)
+
+    if audio_files:
+        return audio_files
+    return other_files
+
+
+def _download_audio_with_cookie(
+    source: str,
+    workdir: Path,
+    *,
+    cookiefile: str | None,
+    site: str,
+    source_url: str | None,
+) -> dict[str, Any]:
+    proxy = _proxy_for_audio_site(site)
+    target = source_url or f"{AUDIO_SEARCH_PREFIX}:{source}"
+
+    if site == "yandex_music" and source_url:
+        target = _normalize_yandex_music_url(source_url, cookiefile=cookiefile, proxy=proxy)
+
+    outtmpl = str(workdir / "%(playlist_index)s_%(title).180B_%(id)s.%(ext)s")
+    opts = _ytdlp_common_opts(outtmpl=outtmpl, proxy=proxy, cookiefile=cookiefile)
+    noplaylist = _audio_noplaylist(site, target if source_url else None)
+    opts.update({
+        "format": AUDIO_FORMAT,
+        "noplaylist": noplaylist,
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
+            "preferredcodec": AUDIO_CODEC,
+            "preferredquality": AUDIO_QUALITY,
         }],
-        "noplaylist": noplaylist,
-        # устойчивость сети
-        "retries": 10,
-        "fragment_retries": 10,
-        "extractor_retries": 3,
-        "concurrent_fragment_downloads": 4,
     })
+    if not noplaylist:
+        opts["playlistend"] = max(1, min(MAX_ITEMS_PER_LINK, 50))
 
-    if is_yandex:
-        ydl_opts.setdefault("http_headers", {})
-        ydl_opts["http_headers"].update({
+    if site == "yandex_music":
+        opts.setdefault("http_headers", {})
+        opts["http_headers"].update({
             "Referer": "https://music.yandex.ru/",
             "User-Agent": "Mozilla/5.0",
         })
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        entry = info["entries"][0] if isinstance(info, dict) and info.get("entries") else info
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(target, download=False)
+        entries = _audio_entries_from_info(info)
+        if not entries:
+            raise FileNotFoundError("Ничего не найдено")
+        for entry in entries[:max(1, min(MAX_ITEMS_PER_LINK, 50))]:
+            dur = entry.get("duration")
+            if dur and dur > MAX_DURATION_SEC:
+                raise ValueError(
+                    f"Трек слишком длинный: {int(dur)} сек. Максимум: {MAX_DURATION_SEC} сек."
+                )
+        ydl.download([target])
 
-        prepared = ydl.prepare_filename(entry)
-        audio_filename = (
-            prepared
-            .replace(".webm", ".mp3")
-            .replace(".m4a", ".mp3")
-            .replace(".opus", ".mp3")
-        )
+    all_files = _collect_downloaded_files(workdir)
+    selected_files = _select_audio_downloads(all_files)
+    selected_files = selected_files[:max(1, min(MAX_ITEMS_PER_LINK, 50))]
 
-        if not os.path.exists(audio_filename):
-            candidates = glob.glob("*.mp3")
-            if not candidates:
-                raise FileNotFoundError("Не удалось найти итоговый MP3.")
-            audio_filename = max(candidates, key=os.path.getmtime)
+    if not selected_files:
+        raise FileNotFoundError("Не удалось найти итоговый аудиофайл.")
 
-    return audio_filename
+    title = None
+    try:
+        title = entries[0].get("title") if entries else None
+    except Exception:
+        title = None
+
+    return {
+        "title": title,
+        "site": site,
+        "source_url": target if source_url else None,
+        "files": [str(p) for p in selected_files],
+    }
+
+
+def download_audio_with_fallback(source: str, tmp_dir: Path) -> dict[str, Any]:
+    """Download audio from supported URL or search YouTube by text."""
+    source = re.sub(r"\s+", " ", source or "").strip()
+    if not source:
+        raise ValueError("Пустой музыкальный запрос.")
+
+    source_url = _extract_audio_url(source)
+    if _looks_like_url(source) and not source_url:
+        raise ValueError("Эта ссылка не поддерживается для скачивания музыки.")
+
+    site = _audio_site_for_url(source_url) if source_url else "youtube_search"
+    if site == "unknown":
+        raise ValueError("Эта ссылка не поддерживается для скачивания музыки.")
+
+    cookie_files = _cookie_files_for_audio_site(site)
+    attempts: list[str | None] = []
+    if TRY_NO_COOKIES_FIRST:
+        attempts.append(None)
+    attempts.extend(cookie_files)
+    if not attempts:
+        attempts.append(None)
+
+    last_err: Exception | None = None
+    last_err_text: str | None = None
+
+    for idx, cookiefile in enumerate(attempts, start=1):
+        _cleanup_tmp_dir(tmp_dir)
+        try:
+            logger.info(
+                "[music:%s] Попытка %d/%d скачать аудио. cookies=%s proxy=%s",
+                site,
+                idx,
+                len(attempts),
+                "нет" if not cookiefile else cookiefile,
+                "да" if _proxy_for_audio_site(site) else "нет",
+            )
+            return _download_audio_with_cookie(
+                source,
+                tmp_dir,
+                cookiefile=cookiefile,
+                site=site,
+                source_url=source_url,
+            )
+        except DownloadError as e:
+            last_err = e
+            last_err_text = str(e)
+            logger.warning("[music:%s] yt-dlp DownloadError: %s", site, e)
+        except Exception as e:
+            last_err = e
+            last_err_text = str(e)
+            logger.warning("[music:%s] Ошибка скачивания: %s", site, e)
+
+    raise RuntimeError(last_err_text or "Не удалось скачать аудио.") from last_err
+
+
+def _audio_cache_key_source(source: str) -> str:
+    source_url = _extract_audio_url(source)
+    if source_url:
+        return source_url
+    return re.sub(r"\s+", " ", source).strip().lower()
+
+
+async def _get_or_download_audio_entry(
+    source: str,
+    *,
+    requester_id: int | None,
+) -> dict[str, Any]:
+    del requester_id  # reserved for future per-user music cookies
+    source_key = _audio_cache_key_source(source)
+    key = _cache_key(f"audio:{source_key}")
+
+    entry = _cache_index.get(key)
+    if entry and _cache_entry_is_usable(entry):
+        return entry
+
+    lock = _get_or_create_lock(key)
+    async with lock:
+        entry = _cache_index.get(key)
+        if entry and _cache_entry_is_usable(entry):
+            return entry
+
+        tmp_dir = Path("/tmp") / f"music_{key[:12]}_{uuid.uuid4().hex[:8]}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            result = await asyncio.to_thread(download_audio_with_fallback, source, tmp_dir)
+            files = [Path(p) for p in result["files"]]
+            cache_dir = _cache_dir_for_key(key)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+
+            items: list[dict[str, Any]] = []
+            for p in files:
+                target = cache_dir / p.name
+                if target.exists():
+                    target = cache_dir / f"{p.stem}_{int(_now())}{p.suffix}"
+                shutil.move(str(p), str(target))
+                items.append({
+                    "kind": "audio",
+                    "local_filename": target.name,
+                    "tg_file_id": None,
+                    "title": target.stem,
+                })
+
+            entry = {
+                "key": key,
+                "url": result.get("source_url") or source,
+                "site": result.get("site") or "music",
+                "title": result.get("title") or source,
+                "created_at": _now(),
+                "expires_at": _now() + float(CACHE_TTL_SECONDS),
+                "items": items,
+            }
+            _write_cache_entry(entry)
+            return entry
+        except Exception:
+            _purge_cache_entry(key)
+            raise
+        finally:
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 # -------------------------
@@ -1287,8 +1500,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "Привет, я Загружатель!\n\n"
         "Отправь мне ссылку на Reels / пост / сторис (Instagram), TikTok, YouTube (включая Shorts) или VK — и я постараюсь прислать медиа.\n\n"
-        "Я также могу найти и прислать музыку, если ты отправишь мне название в формате:\n"
-        "`Исполнитель - Название`\n\n"
+        "Музыку можно скачать командой `/music ссылка` или `/music Исполнитель - Название`.\n"
+        "Поддерживаются YouTube audio-only, Яндекс.Музыка и SoundCloud.\n\n"
         "Я работаю и в групповых чатах (нужны права на чтение/отправку сообщений).",
         parse_mode="Markdown",
     )
@@ -1321,6 +1534,35 @@ async def pechenyuha_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "Я сохраню его как твой Instagram cookies и буду использовать в очереди попыток скачивания.",
         parse_mode="Markdown",
     )
+
+
+async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.message.text is None:
+        return
+
+    source = _extract_music_command_payload(update.message.text)
+    if not source:
+        await update.message.reply_text(
+            "Пришли так: `/music https://youtu.be/...` или `/music Исполнитель - Название`.\n"
+            "Ещё подойдут ссылки Яндекс.Музыки и SoundCloud.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if update.message.chat_id:
+        save_user(update.message.chat_id)
+
+    requester_id = update.effective_user.id if update.effective_user else None
+
+    async with sema:
+        try:
+            entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
+            await send_cache_entry(update, context, entry)
+        except ValueError as e:
+            await update.message.reply_text(str(e))
+        except Exception as e:
+            logger.error("Ошибка при загрузке музыки: %s", e)
+            await update.message.reply_text("Не удалось загрузить музыку.")
 
 
 async def handle_cookie_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1395,11 +1637,6 @@ def _looks_like_supported_video_url(text: str) -> bool:
 
 def _extract_supported_video_url(text: str) -> str | None:
     match = SUPPORTED_VIDEO_URL_RE.search(text)
-    return match.group(0).rstrip(".,!?)];") if match else None
-
-
-def _extract_yandex_url(text: str) -> str | None:
-    match = YANDEX_FULL_URL_RE.search(text)
     return match.group(0).rstrip(".,!?)];") if match else None
 
 
@@ -1526,17 +1763,352 @@ async def _ensure_inline_file_ids(
         _write_cache_entry(entry)
 
 
-def _inline_article(title: str, message: str) -> InlineQueryResultArticle:
+def _inline_article(title: str, message: str, *, switch_query: str | None = None) -> InlineQueryResultArticle:
+    reply_markup = None
+    if switch_query:
+        reply_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Проверить готовность", switch_inline_query_current_chat=switch_query)
+        ]])
+
     return InlineQueryResultArticle(
         id=str(uuid.uuid4()),
         title=title,
         input_message_content=InputTextMessageContent(message),
+        reply_markup=reply_markup,
     )
 
 
 def _entry_has_inline_file_ids(entry: dict[str, Any]) -> bool:
     items = entry.get("items") or []
     return bool(items) and all(item.get("tg_file_id") for item in items)
+
+
+def _cached_media_entry(url: str) -> dict[str, Any] | None:
+    entry = _cache_index.get(_cache_key(url))
+    return entry if entry and _cache_entry_is_usable(entry) else None
+
+
+def _cached_audio_entry(source: str) -> dict[str, Any] | None:
+    key = _cache_key(f"audio:{_audio_cache_key_source(source)}")
+    entry = _cache_index.get(key)
+    return entry if entry and _cache_entry_is_usable(entry) else None
+
+
+def _inline_audio_results(entry: dict[str, Any]) -> list[Any]:
+    results: list[Any] = []
+    for i, item in enumerate(entry.get("items") or [], start=1):
+        file_id = item.get("tg_file_id")
+        if not file_id:
+            continue
+        results.append(InlineQueryResultCachedAudio(
+            id=f"{str(entry['key'])[:44]}_audio_{i}",
+            audio_file_id=file_id,
+        ))
+    return results
+
+
+def _inline_media_results(entry: dict[str, Any]) -> list[Any]:
+    results: list[Any] = []
+    for i, item in enumerate(entry.get("items") or [], start=1):
+        file_id = item.get("tg_file_id")
+        if not file_id:
+            continue
+        kind = item.get("kind")
+        result_id = f"{str(entry['key'])[:48]}_{i}"
+        if kind == "photo":
+            results.append(InlineQueryResultCachedPhoto(id=result_id, photo_file_id=file_id))
+        elif kind == "video":
+            results.append(InlineQueryResultCachedVideo(id=result_id, video_file_id=file_id, title="Видео"))
+        elif kind == "audio":
+            results.append(InlineQueryResultCachedAudio(id=result_id, audio_file_id=file_id))
+        else:
+            results.append(InlineQueryResultCachedDocument(id=result_id, document_file_id=file_id, title="Файл"))
+    return results
+
+
+def _inline_result_to_payload(result: Any) -> dict[str, Any]:
+    if isinstance(result, dict):
+        return result
+    if hasattr(result, "to_dict"):
+        return result.to_dict()
+    raise TypeError(f"Unsupported inline result type: {type(result)!r}")
+
+
+def _guest_article_result(title: str, message: str) -> dict[str, Any]:
+    return {
+        "type": "article",
+        "id": str(uuid.uuid4()),
+        "title": title,
+        "input_message_content": {
+            "message_text": message,
+        },
+    }
+
+
+async def _answer_guest_query(guest_query_id: str, result: Any) -> None:
+    payload = {
+        "guest_query_id": guest_query_id,
+        "result": _inline_result_to_payload(result),
+    }
+
+    def _post() -> None:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TOKEN}/answerGuestQuery",
+            json=payload,
+            timeout=20,
+        )
+        try:
+            data = response.json()
+        except Exception as e:
+            raise RuntimeError(f"Telegram answerGuestQuery returned non-JSON response: {response.status_code}") from e
+        if not data.get("ok"):
+            raise RuntimeError(data.get("description") or f"answerGuestQuery failed with HTTP {response.status_code}")
+
+    await asyncio.to_thread(_post)
+
+
+def _first_guest_result_from_entry(entry: dict[str, Any]) -> dict[str, Any] | None:
+    items = entry.get("items") or []
+    audio_only = bool(items) and all(isinstance(item, dict) and item.get("kind") == "audio" for item in items)
+    results = _inline_audio_results(entry) if audio_only else _inline_media_results(entry)
+    if not results:
+        return None
+    return _inline_result_to_payload(results[0])
+
+
+async def _prepare_inline_cache_task(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    task_key: str,
+    kind: str,
+    source: str,
+    requester_id: int | None,
+    upload_chat_id: int,
+) -> None:
+    try:
+        if not upload_chat_id:
+            return
+        async with sema:
+            if kind == "audio":
+                entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
+            else:
+                entry = await _get_or_download_media_entry(source, requester_id=requester_id)
+            await _ensure_inline_file_ids(context, entry=entry, upload_chat_id=upload_chat_id)
+    except Exception as e:
+        logger.warning("Не удалось подготовить inline-кэш (%s): %s", kind, e)
+    finally:
+        _inline_prepare_tasks.discard(task_key)
+
+
+def _schedule_inline_cache_prepare(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    kind: str,
+    source: str,
+    requester_id: int | None,
+    upload_chat_id: int,
+) -> bool:
+    if not upload_chat_id:
+        return False
+
+    if kind == "audio":
+        audio_key = _cache_key("audio:" + _audio_cache_key_source(source))
+        key = f"inline:audio:{audio_key}"
+    else:
+        key = f"inline:media:{_cache_key(source)}"
+
+    if key in _inline_prepare_tasks:
+        return True
+
+    _inline_prepare_tasks.add(key)
+    context.application.create_task(_prepare_inline_cache_task(
+        context,
+        task_key=key,
+        kind=kind,
+        source=source,
+        requester_id=requester_id,
+        upload_chat_id=upload_chat_id,
+    ))
+    return False
+
+
+def _extract_music_command_payload(text: str) -> str:
+    return re.sub(r"^/music(?:@\w+)?(?:\s+|$)", "", text.strip(), count=1, flags=re.I).strip()
+
+
+def _extract_inline_music_source(text: str) -> str | None:
+    stripped = text.strip()
+    if re.match(r"^/?music(?:@\w+)?(?:\s+|$)", stripped, re.I):
+        payload = re.sub(r"^/?music(?:@\w+)?(?:\s+|$)", "", stripped, count=1, flags=re.I).strip()
+        return payload or None
+
+    audio_url = _extract_audio_url(stripped)
+    if not audio_url:
+        return None
+    if YANDEX_URL_RE.search(audio_url) or SOUNDCLOUD_FULL_URL_RE.search(audio_url):
+        return audio_url
+    return None
+
+
+def _raw_guest_message_from_update(update: Update) -> Any:
+    guest_message = getattr(update, "guest_message", None)
+    if guest_message is not None:
+        return guest_message
+
+    api_kwargs = getattr(update, "api_kwargs", None) or {}
+    return api_kwargs.get("guest_message")
+
+
+def _guest_message_value(message: Any, key: str) -> Any:
+    if isinstance(message, dict):
+        return message.get(key)
+    if key == "from":
+        return getattr(message, "from_user", None)
+    return getattr(message, key, None)
+
+
+def _guest_message_text(message: Any) -> str | None:
+    text = _guest_message_value(message, "text") or _guest_message_value(message, "caption")
+    return text if isinstance(text, str) else None
+
+
+def _guest_message_user_id(message: Any) -> int | None:
+    user = _guest_message_value(message, "from")
+    if isinstance(user, dict):
+        user_id = user.get("id")
+    else:
+        user_id = getattr(user, "id", None)
+    return int(user_id) if isinstance(user_id, int) else None
+
+
+async def _normalize_guest_text(text: str, context: ContextTypes.DEFAULT_TYPE) -> str:
+    username = await _get_bot_username(context)
+    if not username:
+        return re.sub(r"\s+", " ", text).strip()
+
+    mention_re = re.compile(rf"(?<!\w)@{re.escape(username)}(?!\w)", re.I)
+    cleaned = mention_re.sub(" ", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _guest_preparing_message(kind: str, already_running: bool) -> dict[str, Any]:
+    if kind == "audio":
+        title = "Уже готовлю аудио" if already_running else "Готовлю аудио"
+        message = "Аудио ещё готовится. Повтори вызов бота с этой же ссылкой через несколько секунд."
+    else:
+        title = "Уже готовлю медиа" if already_running else "Готовлю медиа"
+        message = "Медиа ещё готовится. Повтори вызов бота с этой же ссылкой через несколько секунд."
+    return _guest_article_result(title, message)
+
+
+async def _answer_guest_from_entry_or_prepare(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    guest_query_id: str,
+    kind: str,
+    source: str,
+    requester_id: int | None,
+) -> None:
+    if kind == "audio":
+        entry = _cached_audio_entry(source)
+    else:
+        entry = _cached_media_entry(source)
+
+    if entry and _entry_has_inline_file_ids(entry):
+        result = _first_guest_result_from_entry(entry)
+        if result:
+            await _answer_guest_query(guest_query_id, result)
+            return
+
+    if not INLINE_CACHE_CHAT_ID:
+        await _answer_guest_query(
+            guest_query_id,
+            _guest_article_result(
+                "Нужен кэш-чат",
+                "Для гостевых ответов медиафайлами настрой INLINE_CACHE_CHAT_ID.",
+            ),
+        )
+        return
+
+    already_running = _schedule_inline_cache_prepare(
+        context,
+        kind=kind,
+        source=source,
+        requester_id=requester_id,
+        upload_chat_id=INLINE_CACHE_CHAT_ID,
+    )
+    await _answer_guest_query(guest_query_id, _guest_preparing_message(kind, already_running))
+
+
+async def handle_guest_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = _raw_guest_message_from_update(update)
+    if message is None:
+        return
+
+    guest_query_id = _guest_message_value(message, "guest_query_id")
+    if not isinstance(guest_query_id, str) or not guest_query_id:
+        return
+
+    raw_text = _guest_message_text(message)
+    if not raw_text:
+        await _answer_guest_query(
+            guest_query_id,
+            _guest_article_result("Нужна ссылка", "Пришли ссылку или /music запрос после упоминания бота."),
+        )
+        return
+
+    text = await _normalize_guest_text(raw_text, context)
+    requester_id = _guest_message_user_id(message)
+
+    if not text:
+        await _answer_guest_query(
+            guest_query_id,
+            _guest_article_result("Нужна ссылка", "Пришли ссылку или /music запрос после упоминания бота."),
+        )
+        return
+
+    music_source = _extract_inline_music_source(text)
+    if not music_source and MUSIC_PATTERN.match(text):
+        music_source = text
+
+    try:
+        if music_source:
+            await _answer_guest_from_entry_or_prepare(
+                context,
+                guest_query_id=guest_query_id,
+                kind="audio",
+                source=music_source,
+                requester_id=requester_id,
+            )
+            return
+
+        video_url = _extract_supported_video_url(text)
+        if video_url:
+            await _answer_guest_from_entry_or_prepare(
+                context,
+                guest_query_id=guest_query_id,
+                kind="media",
+                source=video_url,
+                requester_id=requester_id,
+            )
+            return
+
+        await _answer_guest_query(
+            guest_query_id,
+            _guest_article_result(
+                "Ссылка не найдена",
+                "Укажи ссылку на Instagram, TikTok, YouTube, VK, SoundCloud, Яндекс.Музыку или /music запрос.",
+            ),
+        )
+    except Exception as e:
+        logger.error("Ошибка guest-запроса: %s", e)
+        try:
+            await _answer_guest_query(
+                guest_query_id,
+                _guest_article_result("Не удалось загрузить", "Попробуй повторить позже или отправить ссылку боту напрямую."),
+            )
+        except Exception:
+            pass
 
 
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1547,7 +2119,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = inline_query.query.strip()
     if not text:
         await inline_query.answer(
-            [_inline_article("Вставь ссылку", "Напиши: @bot ссылка на Instagram, TikTok, YouTube, VK или Яндекс.Музыку")],
+            [_inline_article("Вставь ссылку", "Напиши: @bot ссылка на Instagram, TikTok, YouTube, VK, SoundCloud или Яндекс.Музыку")],
             cache_time=1,
             is_personal=True,
         )
@@ -1555,41 +2127,64 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     upload_chat_id = INLINE_CACHE_CHAT_ID
     requester_id = inline_query.from_user.id if inline_query.from_user else None
-    yandex_url = _extract_yandex_url(text)
+    music_source = _extract_inline_music_source(text)
     video_url = _extract_supported_video_url(text)
 
     try:
-        if yandex_url:
-            audio_filename = None
-            try:
-                audio_filename = await asyncio.to_thread(download_audio_by_url, yandex_url)
-                path = Path(audio_filename)
-                file_id = await _upload_inline_cache_item(
-                    context,
-                    chat_id=upload_chat_id,
-                    kind="audio",
-                    path=path,
-                )
+        if music_source:
+            entry = _cached_audio_entry(music_source)
+            if entry and _entry_has_inline_file_ids(entry):
+                results = _inline_audio_results(entry)
+                await inline_query.answer(results[:50], cache_time=0, is_personal=True)
+                return
+
+            if not upload_chat_id:
                 await inline_query.answer(
-                    [InlineQueryResultCachedAudio(id=str(uuid.uuid4()), audio_file_id=file_id)],
-                    cache_time=0,
+                    [_inline_article(
+                        "Нужен кэш-чат",
+                        "Для inline-отправки аудио настрой INLINE_CACHE_CHAT_ID.",
+                    )],
+                    cache_time=1,
                     is_personal=True,
                 )
-            finally:
-                if audio_filename and os.path.exists(audio_filename):
-                    os.remove(audio_filename)
-            return
+                return
 
-        if not video_url:
+            already_running = _schedule_inline_cache_prepare(
+                context,
+                kind="audio",
+                source=music_source,
+                requester_id=requester_id,
+                upload_chat_id=upload_chat_id,
+            )
+            title = "Уже готовлю аудио" if already_running else "Готовлю аудио"
             await inline_query.answer(
-                [_inline_article("Ссылка не найдена", "Укажи ссылку на Instagram, TikTok, YouTube, VK или Яндекс.Музыку после имени бота.")],
+                [_inline_article(
+                    title,
+                    "Файл ещё готовится. Через несколько секунд повтори inline-запрос.",
+                    switch_query=music_source,
+                )],
                 cache_time=1,
                 is_personal=True,
             )
             return
 
-        entry = await _get_or_download_media_entry(video_url, requester_id=requester_id)
-        if not upload_chat_id and not _entry_has_inline_file_ids(entry):
+        if not video_url:
+            await inline_query.answer(
+                [_inline_article("Ссылка не найдена", "Укажи ссылку на Instagram, TikTok, YouTube, VK, SoundCloud или Яндекс.Музыку после имени бота.")],
+                cache_time=1,
+                is_personal=True,
+            )
+            return
+
+        entry = _cached_media_entry(video_url)
+        if entry and _entry_has_inline_file_ids(entry):
+            results = _inline_media_results(entry)
+            if not results:
+                results = [_inline_article("Не удалось подготовить медиа", "Попробуй отправить ссылку боту напрямую.")]
+            await inline_query.answer(results[:50], cache_time=0, is_personal=True)
+            return
+
+        if not upload_chat_id:
             await inline_query.answer(
                 [_inline_article(
                     "Нужен кэш-чат",
@@ -1600,26 +2195,23 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        await _ensure_inline_file_ids(context, entry=entry, upload_chat_id=upload_chat_id)
-
-        results: list[Any] = []
-        for i, item in enumerate(entry.get("items") or [], start=1):
-            file_id = item.get("tg_file_id")
-            if not file_id:
-                continue
-            kind = item.get("kind")
-            result_id = f"{str(entry['key'])[:48]}_{i}"
-            if kind == "photo":
-                results.append(InlineQueryResultCachedPhoto(id=result_id, photo_file_id=file_id))
-            elif kind == "video":
-                results.append(InlineQueryResultCachedVideo(id=result_id, video_file_id=file_id, title="Видео"))
-            else:
-                results.append(InlineQueryResultCachedDocument(id=result_id, document_file_id=file_id, title="Файл"))
-
-        if not results:
-            results = [_inline_article("Не удалось подготовить медиа", "Попробуй отправить ссылку боту напрямую.")]
-
-        await inline_query.answer(results[:50], cache_time=0, is_personal=True)
+        already_running = _schedule_inline_cache_prepare(
+            context,
+            kind="media",
+            source=video_url,
+            requester_id=requester_id,
+            upload_chat_id=upload_chat_id,
+        )
+        title = "Уже готовлю медиа" if already_running else "Готовлю медиа"
+        await inline_query.answer(
+            [_inline_article(
+                title,
+                "Файл ещё готовится. Через несколько секунд повтори inline-запрос.",
+                switch_query=video_url,
+            )],
+            cache_time=1,
+            is_personal=True,
+        )
     except Exception as e:
         logger.error("Ошибка inline-запроса: %s", e)
         await inline_query.answer(
@@ -1663,8 +2255,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    if was_mentioned:
-        text = _extract_yandex_url(text) or _extract_supported_video_url(text) or text
+    if was_mentioned and not re.match(r"^/?music(?:@\w+)?(?:\s+|$)", text, re.I):
+        text = _extract_audio_url(text) or _extract_supported_video_url(text) or text
 
     chat_id = update.message.chat_id
     requester_id = update.effective_user.id if update.effective_user else None
@@ -1678,27 +2270,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         pass
 
     async with sema:
-        # 1) Yandex Music by URL
-        if YANDEX_URL_RE.search(text):
-            audio_filename = None
+        # 1) Music URLs and /music routed audio-only requests
+        music_source = _extract_inline_music_source(text)
+        if music_source:
             try:
-                audio_filename = await asyncio.to_thread(download_audio_by_url, text)
-                from os.path import basename, splitext
-
-                with open(audio_filename, "rb") as audio_file:
-                    await update.message.reply_audio(
-                        audio=audio_file,
-                        title=splitext(basename(audio_filename))[0],
-                    )
+                entry = await _get_or_download_audio_entry(music_source, requester_id=requester_id)
+                await send_cache_entry(update, context, entry)
+            except ValueError as e:
+                await update.message.reply_text(str(e))
             except Exception as e:
-                logger.error(f"Ошибка: {e}")
+                logger.error("Ошибка при загрузке музыки: %s", e)
                 await update.message.reply_text("Не удалось загрузить музыку.")
-            finally:
-                if audio_filename and os.path.exists(audio_filename):
-                    try:
-                        os.remove(audio_filename)
-                    except Exception:
-                        pass
             return
 
         # 2) Supported video/media URLs only
@@ -1718,20 +2300,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         # 3) Music by query
         if MUSIC_PATTERN.match(text):
-            audio_filename = None
             try:
-                audio_filename = await asyncio.to_thread(download_music, text)
-                with open(audio_filename, "rb") as audio_file:
-                    await update.message.reply_audio(audio=audio_file, title=text)
+                entry = await _get_or_download_audio_entry(text, requester_id=requester_id)
+                await send_cache_entry(update, context, entry)
+            except ValueError as e:
+                await update.message.reply_text(str(e))
             except Exception as e:
-                logger.error(f"Ошибка при загрузке музыки: {e}")
+                logger.error("Ошибка при загрузке музыки: %s", e)
                 await update.message.reply_text("Не удалось загрузить музыку.")
-            finally:
-                if audio_filename and os.path.exists(audio_filename):
-                    try:
-                        os.remove(audio_filename)
-                    except Exception:
-                        pass
             return
 
         # Otherwise ignore
@@ -1747,6 +2323,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("pechenyuha", pechenyuha_command))
     app.add_handler(CommandHandler("users", get_users_count))
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("music", music_command))
+    app.add_handler(TypeHandler(Update, handle_guest_update), group=-1)
     app.add_handler(InlineQueryHandler(handle_inline_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_cookie_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

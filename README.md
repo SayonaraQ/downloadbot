@@ -1,6 +1,6 @@
 # Telegram Downloader Bot
 
-Telegram-бот для скачивания и отправки медиа из Instagram, YouTube, TikTok, VK и Яндекс.Музыки.
+Telegram-бот для скачивания и отправки медиа из Instagram, YouTube, TikTok, VK, SoundCloud и Яндекс.Музыки.
 
 Бот умеет работать в личных сообщениях, группах и через Telegram inline mode: пользователь может написать `@bot_username <ссылка>` прямо в любом чате, выбрать результат, и медиа будет отправлено в этот же чат.
 
@@ -10,7 +10,8 @@ Telegram-бот для скачивания и отправки медиа из 
 - YouTube и YouTube Shorts.
 - TikTok и короткие ссылки `vt.tiktok.com`.
 - VK, `vk.cc` и `vkvideo.ru`.
-- Яндекс.Музыка по ссылке.
+- Яндекс.Музыка и SoundCloud по ссылке.
+- `/music <ссылка>` для скачивания только звука из YouTube, Яндекс.Музыки или SoundCloud.
 - Поиск музыки по тексту в формате `Исполнитель - Название`.
 - Работа в личке, группах и супергруппах.
 - Inline-вызов из любого чата через `@bot_username ссылка`.
@@ -60,6 +61,17 @@ https://www.instagram.com/reel/...
 
 Бот скачает медиа и отправит результат в этот же чат.
 
+Для музыки используйте команду:
+
+```text
+/music https://youtu.be/...
+/music https://music.yandex.ru/album/.../track/...
+/music https://soundcloud.com/artist/track
+/music Исполнитель - Название
+```
+
+Обычная ссылка YouTube без `/music` по-прежнему скачивается как видео. С `/music` бот отправляет только аудио.
+
 ### Группа или супергруппа
 
 Если бот добавлен в чат и имеет доступ к сообщениям, можно отправлять ссылку обычным сообщением:
@@ -102,7 +114,7 @@ Telegram покажет inline-result. После выбора результа�
 Выберите бота и задайте placeholder, например:
 
 ```text
-Вставь ссылку на Instagram, TikTok, YouTube, VK или Яндекс.Музыку
+Вставь ссылку на Instagram, TikTok, YouTube, VK, SoundCloud или Яндекс.Музыку
 ```
 
 ### Кэш-чат для inline
@@ -149,6 +161,8 @@ IG_COOKIES_FILES=/app/cookies/instagram_main.txt,/app/cookies/instagram_backup.t
 YT_COOKIES_FILES=/app/cookies/youtube.txt
 TT_COOKIES_FILES=/app/cookies/tiktok.txt
 VK_COOKIES_FILES=/app/cookies/vk.txt
+SC_COOKIES_FILES=/app/cookies/soundcloud.txt
+YA_COOKIES_FILES=/app/cookies/yandex.txt
 COOKIES_FILES=/app/cookies/fallback.txt
 ```
 
@@ -156,6 +170,8 @@ COOKIES_FILES=/app/cookies/fallback.txt
 - `YT_COOKIES_FILES` - cookies для YouTube.
 - `TT_COOKIES_FILES` - cookies для TikTok.
 - `VK_COOKIES_FILES` - cookies для VK.
+- `SC_COOKIES_FILES` - cookies для SoundCloud.
+- `YA_COOKIES_FILES` или `YA_COOKIES_FILE` - cookies для Яндекс.Музыки.
 - `COOKIES_FILES` или `COOKIES_FILE` - общий fallback для всех сайтов.
 
 Списки можно разделять запятой, точкой с запятой или переносом строки.
@@ -219,11 +235,26 @@ WEBHOOK_SECRET_TOKEN=secret-token
 ### Яндекс.Музыка
 
 ```env
+YA_PROXY=socks5://user:pass@host:port
 RU_PROXY=socks5://user:pass@host:port
-YA_COOKIES_FILE=/app/cookies/yandex.txt
+YA_COOKIES_FILES=/app/cookies/yandex.txt
 ```
 
-Для некоторых ссылок Яндекс.Музыки могут понадобиться proxy и cookies.
+`YA_PROXY` используется только для Яндекс.Музыки. Если он не задан, бот возьмет `RU_PROXY`. Это удобно, когда общий российский proxy нужен только для сервисов с региональными ограничениями.
+
+Если вместо proxy используется NetBird exit node `ru_all_exit_node`, маршрут должен быть настроен на уровне хоста или Docker-сети: контейнер должен видеть Яндекс.Музыку через этот маршрут. В таком варианте `YA_PROXY` можно не задавать. Если NetBird поднимает локальный SOCKS/HTTP proxy, укажите его в `YA_PROXY`, например `socks5://127.0.0.1:1080`.
+
+### Музыка
+
+```env
+AUDIO_FORMAT=bestaudio/best
+AUDIO_CODEC=mp3
+AUDIO_QUALITY=192
+AUDIO_SEARCH_PREFIX=ytsearch1
+```
+
+- `AUDIO_CODEC` - итоговый кодек после FFmpeg, по умолчанию `mp3`.
+- `AUDIO_SEARCH_PREFIX` - источник поиска для текстовых запросов, по умолчанию первый результат YouTube.
 
 ## Instagram Cookies
 
@@ -265,6 +296,7 @@ Cookies должны быть в Netscape format: строки с tab-разде
 ## Команды Бота
 
 - `/start` - краткая инструкция.
+- `/music <ссылка или запрос>` - скачать аудио из YouTube, Яндекс.Музыки, SoundCloud или поиска.
 - `/pechenyuha` - начать загрузку Instagram cookies.
 - `/users` - количество сохраненных chat id, доступно только `ADMIN_ID`, если он задан.
 
@@ -323,7 +355,9 @@ find data/ig_user_cookies -type f -name 'user_*.txt' -printf '%p %s bytes\n'
 
 - Бот реагирует только на поддерживаемые домены.
 - Обычные сообщения без ссылок игнорируются, кроме поиска музыки в формате `Исполнитель - Название`.
+- YouTube-ссылка обычным сообщением скачивается как видео; YouTube-ссылка через `/music` скачивается как аудио.
 - Inline-запросы должны содержать поддерживаемую ссылку.
+- Если inline-файл ещё не готов, бот быстро отвечает результатом "Готовлю..." и прогревает кэш в фоне. Повторный inline-запрос через несколько секунд отдаст уже готовый `file_id`.
 - Telegram inline API не позволяет боту самовольно отправлять сообщение в чужой чат: пользователь выбирает inline-result вручную.
 - Для inline media нужен заранее полученный Telegram `file_id`, поэтому рекомендуется `INLINE_CACHE_CHAT_ID`.
 - Instagram может требовать cookies даже для публичных Reels из-за rate limit, возраста, региона или авторизации.
