@@ -132,6 +132,7 @@ MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "600"))
 MAX_SIZE_MB = int((os.getenv("MAX_SIZE_MB") or os.getenv("MAX_UPLOAD_MB") or "48").strip())
 MAX_ITEMS_PER_LINK = int(os.getenv("MAX_ITEMS_PER_LINK", "10"))
 TRY_NO_COOKIES_FIRST = (os.getenv("TRY_NO_COOKIES_FIRST", "1").strip() != "0")
+IG_TRY_NO_COOKIES_FIRST = (os.getenv("IG_TRY_NO_COOKIES_FIRST", "0").strip() != "0")
 
 # Network / special cases
 RU_PROXY = (os.getenv("RU_PROXY") or "").strip() or None
@@ -153,8 +154,14 @@ DEFAULT_VIDEO_FORMAT = (
     "bv*[ext=mp4]+ba[ext=m4a]/"
     "bv*+ba/best"
 )
+DEFAULT_INSTAGRAM_VIDEO_FORMAT = (
+    "best[ext=mp4][vcodec!=none][acodec!=none]/"
+    f"{DEFAULT_VIDEO_FORMAT}"
+)
 VIDEO_FORMAT = os.getenv("VIDEO_FORMAT", DEFAULT_VIDEO_FORMAT)
+INSTAGRAM_VIDEO_FORMAT = os.getenv("INSTAGRAM_VIDEO_FORMAT", DEFAULT_INSTAGRAM_VIDEO_FORMAT)
 VIDEO_FORMAT_FALLBACK = os.getenv("VIDEO_FORMAT_FALLBACK", "bestvideo*+bestaudio/best")
+INSTAGRAM_VIDEO_FORMAT_FALLBACK = os.getenv("INSTAGRAM_VIDEO_FORMAT_FALLBACK", VIDEO_FORMAT_FALLBACK)
 MERGE_OUTPUT_FORMAT = os.getenv("MERGE_OUTPUT_FORMAT", "mp4")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
@@ -187,6 +194,8 @@ _cache_locks: dict[str, asyncio.Lock] = {}
 
 # In-memory cache index (also persisted in meta.json)
 _cache_index: dict[str, dict[str, Any]] = {}
+_last_success_cookie_by_site: dict[str, str | None] = {}
+_last_success_cookie_lock = threading.Lock()
 
 # Inline cache warm-up tasks. Inline answers must be fast, so expensive downloads
 # are prepared in the background and served from Telegram file_id on the next query.
@@ -372,6 +381,50 @@ def _cookie_files_for_site(site: str, preferred_user_id: int | None = None) -> l
             out.append(x)
             seen.add(x)
     return out
+
+
+def _try_no_cookies_first_for_site(site: str, cookie_files: list[str]) -> bool:
+    if not cookie_files:
+        return True
+    if site == "instagram":
+        return IG_TRY_NO_COOKIES_FIRST
+    return TRY_NO_COOKIES_FIRST
+
+
+def _ordered_download_attempts(site: str, cookie_files: list[str]) -> list[str | None]:
+    ordered_cookies = list(cookie_files)
+    with _last_success_cookie_lock:
+        last_success_cookie = _last_success_cookie_by_site.get(site)
+
+    if last_success_cookie and last_success_cookie in ordered_cookies:
+        ordered_cookies = [last_success_cookie] + [
+            cookiefile for cookiefile in ordered_cookies if cookiefile != last_success_cookie
+        ]
+
+    attempts: list[str | None] = []
+    if _try_no_cookies_first_for_site(site, ordered_cookies):
+        attempts.append(None)
+    attempts.extend(ordered_cookies)
+    if not attempts:
+        attempts.append(None)
+    return attempts
+
+
+def _remember_successful_cookie(site: str, cookiefile: str | None) -> None:
+    with _last_success_cookie_lock:
+        _last_success_cookie_by_site[site] = cookiefile
+
+
+def _video_format_for_site(site: str) -> str:
+    if site == "instagram":
+        return INSTAGRAM_VIDEO_FORMAT
+    return VIDEO_FORMAT
+
+
+def _video_format_fallback_for_site(site: str) -> str:
+    if site == "instagram":
+        return INSTAGRAM_VIDEO_FORMAT_FALLBACK
+    return VIDEO_FORMAT_FALLBACK
 
 
 def _cache_key(url: str) -> str:
@@ -884,7 +937,7 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
         opts["merge_output_format"] = MERGE_OUTPUT_FORMAT
         return opts
 
-    opts = _build_opts(VIDEO_FORMAT)
+    opts = _build_opts(_video_format_for_site(site))
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -911,7 +964,7 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
         if not targets:
             targets = [url]
 
-        ydl.download(targets)
+        ydl.process_ie_result(selected_info, download=True)
 
     all_files = _collect_downloaded_files(workdir)
     selected_files, dropped_files = _select_primary_downloads(all_files)
@@ -923,7 +976,7 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
             ", ".join(path.name for path in all_files),
         )
         _cleanup_tmp_dir(workdir)
-        fallback_opts = _build_opts(VIDEO_FORMAT_FALLBACK)
+        fallback_opts = _build_opts(_video_format_fallback_for_site(site))
         with YoutubeDL(fallback_opts) as ydl:
             ydl.download(targets)
         all_files = _collect_downloaded_files(workdir)
@@ -963,11 +1016,7 @@ def download_media_with_fallback(
 ) -> dict[str, Any]:
     """Try to download using no cookies (optional) and then multiple cookie files."""
     cookie_files = _cookie_files_for_site(site, preferred_user_id=preferred_user_id)
-
-    attempts: list[str | None] = []
-    if TRY_NO_COOKIES_FIRST:
-        attempts.append(None)
-    attempts.extend(cookie_files)
+    attempts = _ordered_download_attempts(site, cookie_files)
 
     last_err: Exception | None = None
     last_err_text: str | None = None
@@ -986,7 +1035,9 @@ def download_media_with_fallback(
             logger.info(
                 f"[{site}] Попытка {idx}/{len(attempts)} скачать URL. cookies={'нет' if not cookiefile else cookiefile}"
             )
-            return _download_media_with_cookie(url, tmp_dir, cookiefile=cookiefile, site=site)
+            result = _download_media_with_cookie(url, tmp_dir, cookiefile=cookiefile, site=site)
+            _remember_successful_cookie(site, cookiefile)
+            return result
         except DownloadError as e:
             last_err = e
             last_err_text = str(e)
