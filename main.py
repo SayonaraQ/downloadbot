@@ -155,7 +155,7 @@ DEFAULT_VIDEO_FORMAT = (
     "bv*+ba/best"
 )
 DEFAULT_INSTAGRAM_VIDEO_FORMAT = (
-    "best[ext=mp4][vcodec!=none][acodec!=none]/"
+    "best[ext=mp4]/"
     f"{DEFAULT_VIDEO_FORMAT}"
 )
 VIDEO_FORMAT = os.getenv("VIDEO_FORMAT", DEFAULT_VIDEO_FORMAT)
