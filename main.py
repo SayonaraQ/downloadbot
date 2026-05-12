@@ -304,7 +304,12 @@ def _list_uploaded_ig_cookie_files(preferred_user_id: int | None = None) -> list
     if preferred_path and preferred_path.exists():
         ordered_paths.append(preferred_path)
 
-    for path in sorted(IG_USER_COOKIES_DIR.glob("user_*.txt")):
+    cookie_paths = sorted(
+        IG_USER_COOKIES_DIR.glob("user_*.txt"),
+        key=lambda p: (p.stat().st_mtime_ns, p.name),
+        reverse=True,
+    )
+    for path in cookie_paths:
         if not path.is_file():
             continue
         if preferred_path and path == preferred_path:
