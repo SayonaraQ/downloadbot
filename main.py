@@ -1382,7 +1382,9 @@ def _download_audio_with_cookie(
                 raise ValueError(
                     f"Трек слишком длинный: {int(dur)} сек. Максимум: {MAX_DURATION_SEC} сек."
                 )
-        ydl.download([target])
+        processed_info = ydl.process_ie_result(info, download=True)
+        if isinstance(processed_info, dict):
+            entries = _audio_entries_from_info(processed_info) or entries
 
     all_files = _collect_downloaded_files(workdir)
     selected_files = _select_audio_downloads(all_files)
