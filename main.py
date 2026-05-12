@@ -56,6 +56,14 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+class UserFacingDownloadError(ValueError):
+    """Download failed for a reason that is safe and useful to show to the user."""
+
+
+class YandexMusicPreviewError(UserFacingDownloadError):
+    pass
+
+
 def _patch_ytdlp_yandex_music_https() -> None:
     """Yandex Music sometimes returns protocol-relative URLs that yt-dlp opens as HTTP."""
     try:
@@ -1336,6 +1344,53 @@ def _select_audio_downloads(files: list[Path]) -> list[Path]:
     return other_files
 
 
+def _media_duration_seconds(path: Path) -> float | None:
+    try:
+        probe = _probe_media(path)
+    except Exception as e:
+        logger.warning("Не удалось определить длительность %s: %s", path.name, e)
+        return None
+
+    format_info = probe.get("format") or {}
+    duration = format_info.get("duration")
+    try:
+        return float(duration)
+    except (TypeError, ValueError):
+        return None
+
+
+def _expected_audio_duration_seconds(entries: list[dict[str, Any]]) -> float | None:
+    for entry in entries:
+        duration = entry.get("duration")
+        try:
+            value = float(duration)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _ensure_yandex_music_not_preview(files: list[Path], entries: list[dict[str, Any]]) -> None:
+    expected_duration = _expected_audio_duration_seconds(entries)
+    if not expected_duration or expected_duration < 60:
+        return
+
+    shortest_download = min(
+        (duration for path in files if (duration := _media_duration_seconds(path)) is not None),
+        default=None,
+    )
+    if shortest_download is None:
+        return
+
+    if shortest_download <= 45 and shortest_download < expected_duration * 0.5:
+        raise YandexMusicPreviewError(
+            "Яндекс.Музыка отдала только 30-секундный preview. "
+            "Для полного трека нужны cookies Яндекса от аккаунта с доступом к музыке "
+            "через YA_COOKIES_FILE или YA_COOKIES_FILES."
+        )
+
+
 def _download_audio_with_cookie(
     source: str,
     workdir: Path,
@@ -1393,6 +1448,9 @@ def _download_audio_with_cookie(
 
     if not selected_files:
         raise FileNotFoundError("Не удалось найти итоговый аудиофайл.")
+
+    if site == "yandex_music":
+        _ensure_yandex_music_not_preview(selected_files, entries)
 
     title = None
     try:
@@ -1455,11 +1513,17 @@ def download_audio_with_fallback(source: str, tmp_dir: Path) -> dict[str, Any]:
             last_err = e
             last_err_text = str(e)
             logger.warning("[music:%s] yt-dlp DownloadError: %s", site, e)
+        except UserFacingDownloadError as e:
+            last_err = e
+            last_err_text = str(e)
+            logger.warning("[music:%s] %s", site, e)
         except Exception as e:
             last_err = e
             last_err_text = str(e)
             logger.warning("[music:%s] Ошибка скачивания: %s", site, e)
 
+    if isinstance(last_err, UserFacingDownloadError):
+        raise last_err
     raise RuntimeError(last_err_text or "Не удалось скачать аудио.") from last_err
 
 
