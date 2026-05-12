@@ -102,15 +102,6 @@ DEFAULT_VIDEO_FORMAT = (
 )
 VIDEO_FORMAT = os.getenv("VIDEO_FORMAT", DEFAULT_VIDEO_FORMAT)
 VIDEO_FORMAT_FALLBACK = os.getenv("VIDEO_FORMAT_FALLBACK", "bestvideo*+bestaudio/best")
-DEFAULT_INLINE_VIDEO_FORMAT = (
-    "bestvideo[height<=480][vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
-    "best[height<=480][vcodec^=avc1][ext=mp4]/"
-    "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/"
-    "best[height<=480][ext=mp4]/"
-    "best[height<=480]/best"
-)
-INLINE_VIDEO_FORMAT = os.getenv("INLINE_VIDEO_FORMAT", DEFAULT_INLINE_VIDEO_FORMAT)
-INLINE_VIDEO_FORMAT_FALLBACK = os.getenv("INLINE_VIDEO_FORMAT_FALLBACK", "best[height<=480]/best")
 MERGE_OUTPUT_FORMAT = os.getenv("MERGE_OUTPUT_FORMAT", "mp4")
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
@@ -139,7 +130,6 @@ ios_transcode_sema = threading.Semaphore(IOS_TRANSCODE_MAX_PARALLEL)
 
 # Per-URL locks to avoid duplicate downloads
 _cache_locks: dict[str, asyncio.Lock] = {}
-_inline_prepare_tasks: dict[str, asyncio.Task[None]] = {}
 
 # In-memory cache index (also persisted in meta.json)
 _cache_index: dict[str, dict[str, Any]] = {}
@@ -322,12 +312,6 @@ def _cookie_files_for_site(site: str, preferred_user_id: int | None = None) -> l
 
 def _cache_key(url: str) -> str:
     return hashlib.sha256(url.strip().encode("utf-8")).hexdigest()
-
-
-def _cache_key_for_variant(url: str, variant: str | None = None) -> str:
-    if not variant:
-        return _cache_key(url)
-    return _cache_key(f"{variant}:{url}")
 
 
 def _cache_dir_for_key(key: str) -> Path:
@@ -820,15 +804,7 @@ def _check_duration_limit(info: Any) -> None:
             )
 
 
-def _download_media_with_cookie(
-    url: str,
-    workdir: Path,
-    *,
-    cookiefile: str | None,
-    site: str,
-    video_format: str = VIDEO_FORMAT,
-    video_format_fallback: str = VIDEO_FORMAT_FALLBACK,
-) -> dict[str, Any]:
+def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | None, site: str) -> dict[str, Any]:
     """Download url into workdir; return cache entry-like dict with files list."""
 
     outtmpl = str(workdir / "%(id)s_%(playlist_index)s.%(ext)s")
@@ -843,7 +819,7 @@ def _download_media_with_cookie(
         opts["merge_output_format"] = MERGE_OUTPUT_FORMAT
         return opts
 
-    opts = _build_opts(video_format)
+    opts = _build_opts(VIDEO_FORMAT)
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
@@ -882,7 +858,7 @@ def _download_media_with_cookie(
             ", ".join(path.name for path in all_files),
         )
         _cleanup_tmp_dir(workdir)
-        fallback_opts = _build_opts(video_format_fallback)
+        fallback_opts = _build_opts(VIDEO_FORMAT_FALLBACK)
         with YoutubeDL(fallback_opts) as ydl:
             ydl.download(targets)
         all_files = _collect_downloaded_files(workdir)
@@ -919,8 +895,6 @@ def download_media_with_fallback(
     tmp_dir: Path,
     site: str,
     preferred_user_id: int | None = None,
-    video_format: str = VIDEO_FORMAT,
-    video_format_fallback: str = VIDEO_FORMAT_FALLBACK,
 ) -> dict[str, Any]:
     """Try to download using no cookies (optional) and then multiple cookie files."""
     cookie_files = _cookie_files_for_site(site, preferred_user_id=preferred_user_id)
@@ -947,14 +921,7 @@ def download_media_with_fallback(
             logger.info(
                 f"[{site}] Попытка {idx}/{len(attempts)} скачать URL. cookies={'нет' if not cookiefile else cookiefile}"
             )
-            return _download_media_with_cookie(
-                url,
-                tmp_dir,
-                cookiefile=cookiefile,
-                site=site,
-                video_format=video_format,
-                video_format_fallback=video_format_fallback,
-            )
+            return _download_media_with_cookie(url, tmp_dir, cookiefile=cookiefile, site=site)
         except DownloadError as e:
             last_err = e
             last_err_text = str(e)
@@ -1440,12 +1407,9 @@ async def _get_or_download_media_entry(
     url: str,
     *,
     requester_id: int | None,
-    cache_variant: str | None = None,
-    video_format: str = VIDEO_FORMAT,
-    video_format_fallback: str = VIDEO_FORMAT_FALLBACK,
 ) -> dict[str, Any]:
     site = _site_for_url(url)
-    key = _cache_key_for_variant(url, cache_variant)
+    key = _cache_key(url)
 
     entry = _cache_index.get(key)
     if entry and _cache_entry_is_usable(entry):
@@ -1469,8 +1433,6 @@ async def _get_or_download_media_entry(
                 tmp_dir,
                 site,
                 requester_id,
-                video_format,
-                video_format_fallback,
             )
 
             files = [Path(p) for p in result["files"]]
@@ -1519,35 +1481,19 @@ async def _upload_inline_cache_item(
     chat_id: int,
     kind: str,
     path: Path,
-) -> tuple[str, str]:
-    upload_kwargs = {
-        "connect_timeout": 30,
-        "read_timeout": 300,
-        "write_timeout": 300,
-        "pool_timeout": 30,
-    }
-    logger.info("Загружаю inline-кэш %s (%s, %.1f MB)", path.name, kind, path.stat().st_size / 1024 / 1024)
+) -> str:
     with path.open("rb") as f:
         if kind == "photo":
-            msg = await context.bot.send_photo(chat_id=chat_id, photo=f, **upload_kwargs)
-            return msg.photo[-1].file_id, "photo"
+            msg = await context.bot.send_photo(chat_id=chat_id, photo=f)
+            return msg.photo[-1].file_id
         if kind == "video":
-            try:
-                msg = await asyncio.wait_for(
-                    context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True, **upload_kwargs),
-                    timeout=90,
-                )
-                return msg.video.file_id, "video"
-            except Exception as e:
-                logger.warning("send_video для inline-кэша не удался (%s). Загружаю как документ.", e)
-                f.seek(0)
-                msg = await context.bot.send_document(chat_id=chat_id, document=f, **upload_kwargs)
-                return msg.document.file_id, "document"
+            msg = await context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
+            return msg.video.file_id
         if kind == "audio":
-            msg = await context.bot.send_audio(chat_id=chat_id, audio=f, title=path.stem, **upload_kwargs)
-            return msg.audio.file_id, "audio"
-        msg = await context.bot.send_document(chat_id=chat_id, document=f, **upload_kwargs)
-        return msg.document.file_id, "document"
+            msg = await context.bot.send_audio(chat_id=chat_id, audio=f, title=path.stem)
+            return msg.audio.file_id
+        msg = await context.bot.send_document(chat_id=chat_id, document=f)
+        return msg.document.file_id
 
 
 async def _ensure_inline_file_ids(
@@ -1568,14 +1514,12 @@ async def _ensure_inline_file_ids(
         path = cache_dir / local_filename
         if not path.exists() or not path.is_file():
             continue
-        file_id, inline_kind = await _upload_inline_cache_item(
+        item["tg_file_id"] = await _upload_inline_cache_item(
             context,
             chat_id=upload_chat_id,
             kind=item.get("kind") or "document",
             path=path,
         )
-        item["tg_file_id"] = file_id
-        item["inline_kind"] = inline_kind
         changed = True
 
     if changed:
@@ -1593,91 +1537,6 @@ def _inline_article(title: str, message: str) -> InlineQueryResultArticle:
 def _entry_has_inline_file_ids(entry: dict[str, Any]) -> bool:
     items = entry.get("items") or []
     return bool(items) and all(item.get("tg_file_id") for item in items)
-
-
-def _build_inline_media_results(entry: dict[str, Any]) -> list[Any]:
-    results: list[Any] = []
-    for i, item in enumerate(entry.get("items") or [], start=1):
-        file_id = item.get("tg_file_id")
-        if not file_id:
-            continue
-            kind = item.get("inline_kind") or item.get("kind")
-        result_id = f"{str(entry['key'])[:48]}_{i}"
-        if kind == "photo":
-            results.append(InlineQueryResultCachedPhoto(id=result_id, photo_file_id=file_id))
-        elif kind == "video":
-            results.append(InlineQueryResultCachedVideo(id=result_id, video_file_id=file_id, title="Видео"))
-        else:
-            results.append(InlineQueryResultCachedDocument(id=result_id, document_file_id=file_id, title="Файл"))
-    return results
-
-
-async def _prepare_inline_media(
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    url: str,
-    requester_id: int | None,
-    upload_chat_id: int,
-) -> None:
-    entry = await _get_or_download_media_entry(
-        url,
-        requester_id=requester_id,
-        cache_variant="inline",
-        video_format=INLINE_VIDEO_FORMAT,
-        video_format_fallback=INLINE_VIDEO_FORMAT_FALLBACK,
-    )
-    await _ensure_inline_file_ids(context, entry=entry, upload_chat_id=upload_chat_id)
-
-
-def _start_inline_prepare_task(
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    url: str,
-    requester_id: int | None,
-    upload_chat_id: int,
-) -> bool:
-    key = _cache_key_for_variant(url, "inline")
-    task = _inline_prepare_tasks.get(key)
-    if task and not task.done():
-        return False
-
-    async def _runner() -> None:
-        try:
-            await _prepare_inline_media(
-                context,
-                url=url,
-                requester_id=requester_id,
-                upload_chat_id=upload_chat_id,
-            )
-        except Exception as e:
-            logger.error("Ошибка фоновой подготовки inline-медиа: %s", e)
-        finally:
-            _inline_prepare_tasks.pop(key, None)
-
-    _inline_prepare_tasks[key] = asyncio.create_task(_runner())
-    return True
-
-
-async def _wait_for_inline_ready(key: str, *, timeout_seconds: float = 10.0) -> dict[str, Any] | None:
-    deadline = _now() + timeout_seconds
-    while _now() < deadline:
-        entry = _cache_index.get(key)
-        if entry and _cache_entry_is_usable(entry) and _entry_has_inline_file_ids(entry):
-            return entry
-
-        task = _inline_prepare_tasks.get(key)
-        if task and task.done():
-            entry = _cache_index.get(key)
-            if entry and _cache_entry_is_usable(entry) and _entry_has_inline_file_ids(entry):
-                return entry
-            return None
-
-        await asyncio.sleep(0.5)
-
-    entry = _cache_index.get(key)
-    if entry and _cache_entry_is_usable(entry) and _entry_has_inline_file_ids(entry):
-        return entry
-    return None
 
 
 async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1705,7 +1564,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             try:
                 audio_filename = await asyncio.to_thread(download_audio_by_url, yandex_url)
                 path = Path(audio_filename)
-                file_id, _inline_kind = await _upload_inline_cache_item(
+                file_id = await _upload_inline_cache_item(
                     context,
                     chat_id=upload_chat_id,
                     kind="audio",
@@ -1729,14 +1588,8 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        key = _cache_key_for_variant(video_url, "inline")
-        entry = _cache_index.get(key)
-        if entry and _cache_entry_is_usable(entry) and _entry_has_inline_file_ids(entry):
-            results = _build_inline_media_results(entry)
-            await inline_query.answer(results[:50], cache_time=0, is_personal=True)
-            return
-
-        if not upload_chat_id:
+        entry = await _get_or_download_media_entry(video_url, requester_id=requester_id)
+        if not upload_chat_id and not _entry_has_inline_file_ids(entry):
             await inline_query.answer(
                 [_inline_article(
                     "Нужен кэш-чат",
@@ -1747,25 +1600,26 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        started = _start_inline_prepare_task(
-            context,
-            url=video_url,
-            requester_id=requester_id,
-            upload_chat_id=upload_chat_id,
-        )
+        await _ensure_inline_file_ids(context, entry=entry, upload_chat_id=upload_chat_id)
 
-        ready_entry = await _wait_for_inline_ready(key, timeout_seconds=10.0)
-        if ready_entry:
-            results = _build_inline_media_results(ready_entry)
-            await inline_query.answer(results[:50], cache_time=0, is_personal=True)
-            return
+        results: list[Any] = []
+        for i, item in enumerate(entry.get("items") or [], start=1):
+            file_id = item.get("tg_file_id")
+            if not file_id:
+                continue
+            kind = item.get("kind")
+            result_id = f"{str(entry['key'])[:48]}_{i}"
+            if kind == "photo":
+                results.append(InlineQueryResultCachedPhoto(id=result_id, photo_file_id=file_id))
+            elif kind == "video":
+                results.append(InlineQueryResultCachedVideo(id=result_id, video_file_id=file_id, title="Видео"))
+            else:
+                results.append(InlineQueryResultCachedDocument(id=result_id, document_file_id=file_id, title="Файл"))
 
-        title = "Готовлю видео" if started else "Видео ещё готовится"
-        await inline_query.answer(
-            [_inline_article(title, "Видео готовится. Повтори этот же inline-запрос через 10 секунд: @бот ссылка.")],
-            cache_time=1,
-            is_personal=True,
-        )
+        if not results:
+            results = [_inline_article("Не удалось подготовить медиа", "Попробуй отправить ссылку боту напрямую.")]
+
+        await inline_query.answer(results[:50], cache_time=0, is_personal=True)
     except Exception as e:
         logger.error("Ошибка inline-запроса: %s", e)
         await inline_query.answer(
@@ -1888,14 +1742,7 @@ def build_application() -> Application:
     if not TOKEN:
         raise RuntimeError("Не найден TOKEN (или BOT_TOKEN) в .env")
 
-    app = (
-        ApplicationBuilder()
-        .token(TOKEN)
-        .connect_timeout(30)
-        .read_timeout(120)
-        .write_timeout(120)
-        .build()
-    )
+    app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("pechenyuha", pechenyuha_command))
     app.add_handler(CommandHandler("users", get_users_count))
