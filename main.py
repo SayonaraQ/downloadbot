@@ -793,6 +793,7 @@ def _ytdlp_common_opts(outtmpl: str, cookiefile: str | None = None, proxy: str |
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
         "nocheckcertificate": True,
         "outtmpl": outtmpl,
         "restrictfilenames": True,
