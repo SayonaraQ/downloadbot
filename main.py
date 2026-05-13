@@ -1840,8 +1840,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         "Привет, я Загружатель!\n\n"
         "Отправь мне ссылку на Reels / пост / сторис (Instagram), TikTok, YouTube (включая Shorts) или VK — и я постараюсь прислать медиа.\n\n"
-        "Музыку можно скачать командой `/music ссылка` или `/music Исполнитель - Название`.\n"
-        "Поддерживаются YouTube audio-only, Яндекс.Музыка и SoundCloud.\n\n"
+        "Музыку можно искать командой `/music запрос` — покажу варианты с YouTube и SoundCloud, выбери нужный.\n"
+        "Для прямой загрузки по ссылке или top-1 по тексту: `/ytmusic ссылка_или_запрос`.\n"
+        "В inline-режиме: `@bot /music запрос` — выбери трек из списка, он скачается сам.\n\n"
         "Я работаю и в групповых чатах (нужны права на чтение/отправку сообщений).",
         parse_mode="Markdown",
     )
@@ -1883,7 +1884,7 @@ def _fmt_duration(seconds: int | float | None) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
-def _search_music_candidates(query: str, n: int) -> list[dict[str, Any]]:
+def _search_music_candidates(query: str, n: int, prefix: str = "ytsearch") -> list[dict[str, Any]]:
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -1891,14 +1892,14 @@ def _search_music_candidates(query: str, n: int) -> list[dict[str, Any]]:
         "skip_download": True,
     }
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+        info = ydl.extract_info(f"{prefix}{n}:{query}", download=False)
     entries = (info or {}).get("entries") or []
     results = []
     for e in entries:
         if not isinstance(e, dict):
             continue
         vid_id = e.get("id") or ""
-        url = e.get("url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None)
+        url = e.get("url") or e.get("webpage_url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None)
         if not url:
             continue
         results.append({
@@ -1908,6 +1909,26 @@ def _search_music_candidates(query: str, n: int) -> list[dict[str, Any]]:
             "duration": e.get("duration"),
         })
     return results
+
+
+async def _search_music_multi_async(query: str, n_per_source: int) -> list[dict[str, Any]]:
+    """Search YouTube and SoundCloud in parallel, interleave results."""
+    yt_task = asyncio.to_thread(_search_music_candidates, query, n_per_source, "ytsearch")
+    sc_task = asyncio.to_thread(_search_music_candidates, query, n_per_source, "scsearch")
+    yt_res, sc_res = await asyncio.gather(yt_task, sc_task, return_exceptions=True)
+    yt = yt_res if isinstance(yt_res, list) else []
+    sc = sc_res if isinstance(sc_res, list) else []
+    if isinstance(yt_res, Exception):
+        logger.warning("YouTube search failed: %s", yt_res)
+    if isinstance(sc_res, Exception):
+        logger.warning("SoundCloud search failed: %s", sc_res)
+    combined = []
+    for i in range(max(len(yt), len(sc))):
+        if i < len(yt):
+            combined.append({**yt[i], "source": "yt"})
+        if i < len(sc):
+            combined.append({**sc[i], "source": "sc"})
+    return combined
 
 
 async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2012,10 +2033,10 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await update.message.reply_text("Не удалось загрузить музыку.")
         return
 
-    # Свободный текст → поиск и выбор из результатов
+    # Свободный текст → поиск на YouTube + SoundCloud и выбор из результатов
     status_msg = await update.message.reply_text("Ищу…")
     try:
-        candidates = await asyncio.to_thread(_search_music_candidates, source, MUSIC_SEARCH_RESULTS)
+        candidates = await _search_music_multi_async(source, MUSIC_SEARCH_RESULTS)
     except Exception as e:
         logger.error("Ошибка поиска музыки: %s", e)
         await status_msg.edit_text("Не удалось выполнить поиск.")
@@ -2030,8 +2051,9 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     keyboard = []
     for i, c in enumerate(candidates):
+        source_icon = "☁️" if c.get("source") == "sc" else "🎵"
         dur = _fmt_duration(c.get("duration"))
-        label = c["title"]
+        label = f"{source_icon} {c['title']}"
         if c.get("channel"):
             label += f" — {c['channel']}"
         if dur:
@@ -2042,6 +2064,40 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Результаты по «{source}»:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+
+
+def _extract_ytmusic_command_payload(text: str) -> str:
+    return re.sub(r"^/ytmusic(?:@\w+)?(?:\s+|$)", "", text.strip(), count=1, flags=re.I).strip()
+
+
+async def ytmusic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Direct top-1 audio download: URL or free text query (no results picker)."""
+    if update.message is None or update.message.text is None:
+        return
+
+    source = _extract_ytmusic_command_payload(update.message.text)
+    if not source:
+        await update.message.reply_text(
+            "Пришли так: `/ytmusic https://youtu.be/...` или `/ytmusic Исполнитель - Название`.\n"
+            "Подойдут ссылки YouTube, SoundCloud, Яндекс.Музыки.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if update.message.chat_id:
+        save_user(update.message.chat_id)
+
+    requester_id = update.effective_user.id if update.effective_user else None
+
+    async with sema:
+        try:
+            entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
+            await send_cache_entry(update, context, entry)
+        except ValueError as e:
+            await update.message.reply_text(str(e))
+        except Exception as e:
+            logger.error("Ошибка при загрузке музыки (ytmusic): %s", e)
+            await update.message.reply_text("Не удалось загрузить музыку.")
 
 
 async def handle_cookie_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2671,12 +2727,46 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     upload_chat_id = INLINE_CACHE_CHAT_ID
     requester_id = inline_query.from_user.id if inline_query.from_user else None
+    has_music_prefix = bool(re.match(r"^/?music(?:@\w+)?(?:\s+|$)", text.strip(), re.I))
     music_source = _extract_inline_music_source(text)
     if not music_source and MUSIC_PATTERN.match(text):
         music_source = text
     video_url = _extract_supported_video_url(text)
 
     try:
+        # @bot /music <free text> → show multi-source search results
+        if music_source and has_music_prefix and not _looks_like_url(music_source) and len(music_source) >= 2:
+            try:
+                candidates = await _search_music_multi_async(music_source, MUSIC_SEARCH_RESULTS)
+            except Exception as e:
+                logger.warning("Inline music search failed: %s", e)
+                candidates = []
+
+            if not candidates:
+                await inline_query.answer(
+                    [_inline_article("Ничего не найдено", f"По запросу «{music_source}» ничего не нашлось.")],
+                    cache_time=10,
+                    is_personal=False,
+                )
+                return
+
+            results = []
+            for c in candidates:
+                source_icon = "☁️" if c.get("source") == "sc" else "🎵"
+                dur = _fmt_duration(c.get("duration"))
+                title = f"{source_icon} {c['title']}"
+                description = c.get("channel") or ""
+                if dur:
+                    description += f" · {dur}" if description else dur
+                results.append(InlineQueryResultArticle(
+                    id=uuid.uuid4().hex,
+                    title=title[:64],
+                    description=description[:128],
+                    input_message_content=InputTextMessageContent(f"/ytmusic {c['url']}"),
+                ))
+            await inline_query.answer(results[:50], cache_time=30, is_personal=False)
+            return
+
         if music_source:
             entry = _cached_audio_entry(music_source)
             if entry and _entry_has_inline_file_ids(entry):
@@ -2894,6 +2984,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("users", get_users_count))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("music", music_command))
+    app.add_handler(CommandHandler("ytmusic", ytmusic_command))
     app.add_handler(CallbackQueryHandler(music_pick_callback, pattern=r"^mpick:"))
     app.add_handler(TypeHandler(Update, handle_guest_update), group=-1)
     app.add_handler(InlineQueryHandler(handle_inline_query))
