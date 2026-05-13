@@ -17,6 +17,7 @@ from typing import Any, Iterable
 import requests
 from dotenv import load_dotenv
 from telegram import (
+    BotCommand,
     InputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -2719,7 +2720,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = inline_query.query.strip()
     if not text:
         await inline_query.answer(
-            [_inline_article("Вставь ссылку или запрос", "Напиши: @bot ссылка на Instagram, TikTok, YouTube, VK, SoundCloud или Яндекс.Музыку — или @bot Исполнитель - Название для поиска музыки")],
+            [_inline_article("Вставь ссылку на видео или название песни", "Ссылка → скачаю видео. Название трека (или /music запрос) → найду и скачаю музыку.")],
             cache_time=1,
             is_personal=True,
         )
@@ -2946,11 +2947,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
 
+BOT_COMMANDS = [
+    BotCommand("music",   "Поиск музыки: список вариантов YouTube + SoundCloud"),
+    BotCommand("ytmusic", "Скачать музыку напрямую: ссылка или запрос → top-1"),
+    BotCommand("start",   "Описание бота"),
+]
+
+
+async def _set_bot_commands(app: Application) -> None:
+    await app.bot.set_my_commands(BOT_COMMANDS)
+
+
 def build_application() -> Application:
     if not TOKEN:
         raise RuntimeError("Не найден TOKEN (или BOT_TOKEN) в .env")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).post_init(_set_bot_commands).build()
 
     app.add_handler(CommandHandler("pechenyuha", pechenyuha_command))
     app.add_handler(CommandHandler("users", get_users_count))
