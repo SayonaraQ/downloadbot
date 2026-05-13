@@ -18,6 +18,7 @@ import requests
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
+    BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     ForceReply,
     InputFile,
@@ -148,6 +149,7 @@ IG_TRY_NO_COOKIES_FIRST = (os.getenv("IG_TRY_NO_COOKIES_FIRST", "0").strip() != 
 # Network / special cases
 RU_PROXY = (os.getenv("RU_PROXY") or "").strip() or None
 YA_PROXY = (os.getenv("YA_PROXY") or os.getenv("YANDEX_MUSIC_PROXY") or RU_PROXY or "").strip() or None
+YA_TOKEN = (os.getenv("YA_TOKEN") or "").strip() or None
 YA_COOKIES_FILES = os.getenv("YA_COOKIES_FILES") or os.getenv("YA_COOKIES_FILE")
 
 # Audio extraction
@@ -1530,6 +1532,8 @@ def _normalize_yandex_music_url(url: str, *, cookiefile: str | None, proxy: str 
             "User-Agent": "Mozilla/5.0",
             "Referer": "https://music.yandex.ru/",
         }
+        if YA_TOKEN:
+            headers["Authorization"] = f"OAuth {YA_TOKEN}"
         proxies = {"http": proxy, "https": proxy} if proxy else None
 
         if cookiefile and os.path.exists(cookiefile):
@@ -1725,6 +1729,8 @@ def _download_audio_with_cookie(
             "Referer": "https://music.yandex.ru/",
             "User-Agent": "Mozilla/5.0",
         })
+        if YA_TOKEN:
+            opts["http_headers"]["Authorization"] = f"OAuth {YA_TOKEN}"
 
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(target, download=False)
@@ -3098,10 +3104,8 @@ BOT_COMMANDS = [
 
 
 async def _set_bot_commands(app: Application) -> None:
-    # Private chats: show clean /command without @botname suffix
     await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
-    # Groups: no menu (avoids /command@botname clutter)
-    await app.bot.delete_my_commands()
+    await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
 
 
 def build_application() -> Application:
