@@ -2045,14 +2045,17 @@ def _fmt_duration(seconds: int | float | None) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+_YT_ICON_EMOJI_ID = "5334681713316479679"
+_SC_ICON_EMOJI_ID = "5345844509412444249"
+
+
 def _music_search_keyboard(session_id: str, candidates: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     """Build styled inline keyboard for music search results."""
     keyboard = []
     for i, c in enumerate(candidates):
         is_sc = c.get("source") == "sc"
-        source_icon = "☁️" if is_sc else "🎵"
         dur = _fmt_duration(c.get("duration"))
-        label = f"{source_icon} {c['title']}"
+        label = c["title"]
         if c.get("channel"):
             label += f" — {c['channel']}"
         if dur:
@@ -2060,7 +2063,8 @@ def _music_search_keyboard(session_id: str, candidates: list[dict[str, Any]]) ->
         keyboard.append([InlineKeyboardButton(
             label[:64],
             callback_data=f"mpick:{session_id}:{i}",
-            style="primary" if is_sc else "danger",
+            style="primary" if is_sc else "success",
+            icon_custom_emoji_id=_SC_ICON_EMOJI_ID if is_sc else _YT_ICON_EMOJI_ID,
         )])
     return InlineKeyboardMarkup(keyboard)
 
