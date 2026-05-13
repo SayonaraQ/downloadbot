@@ -18,6 +18,8 @@ import requests
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
+    BotCommandScopeAllPrivateChats,
+    ForceReply,
     InputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -2106,9 +2108,8 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     source = _extract_music_command_payload(update.message.text)
     if not source:
         await update.message.reply_text(
-            "Пришли так: `/music https://youtu.be/...` или `/music Gangsta Paradise`.\n"
-            "Ещё подойдут ссылки Яндекс.Музыки и SoundCloud.",
-            parse_mode="Markdown",
+            "Напиши название трека или исполнителя:",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="Например: Каста - Сказка"),
         )
         return
 
@@ -2971,9 +2972,55 @@ async def _normalize_mention_text(text: str, context: ContextTypes.DEFAULT_TYPE)
     return re.sub(r"\s+", " ", cleaned).strip(), count > 0
 
 
+def _is_music_forcereply(message: Any) -> bool:
+    """True if this message is a reply to the bot's /music ForceReply prompt."""
+    reply = getattr(message, "reply_to_message", None)
+    if not reply:
+        return False
+    from_user = getattr(reply, "from_user", None)
+    if not from_user or not getattr(from_user, "is_bot", False):
+        return False
+    reply_text = getattr(reply, "text", "") or ""
+    return "Напиши название трека" in reply_text
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает сообщения, сохраняет chat_id и загружает видео/медиа или музыку."""
     if update.message is None or update.message.text is None:
+        return
+
+    # Reply to /music ForceReply prompt → treat as music search
+    if _is_music_forcereply(update.message):
+        source = update.message.text.strip()
+        if source:
+            if update.message.chat_id:
+                save_user(update.message.chat_id)
+            requester_id = update.effective_user.id if update.effective_user else None
+            async with sema:
+                try:
+                    candidates = await _search_music_multi_async(source, MUSIC_SEARCH_RESULTS)
+                    if not candidates:
+                        await update.message.reply_text("Ничего не найдено.")
+                        return
+                    session_id = uuid.uuid4().hex[:12]
+                    _music_search_sessions[session_id] = candidates
+                    keyboard = []
+                    for i, c in enumerate(candidates):
+                        source_icon = "☁️" if c.get("source") == "sc" else "🎵"
+                        dur = _fmt_duration(c.get("duration"))
+                        label = f"{source_icon} {c['title']}"
+                        if c.get("channel"):
+                            label += f" — {c['channel']}"
+                        if dur:
+                            label += f" [{dur}]"
+                        keyboard.append([InlineKeyboardButton(label[:64], callback_data=f"mpick:{session_id}:{i}")])
+                    await update.message.reply_text(
+                        f"Результаты по «{source}»:",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                except Exception as e:
+                    logger.error("Ошибка поиска через ForceReply: %s", e)
+                    await update.message.reply_text("Не удалось выполнить поиск.")
         return
 
     text, was_mentioned = await _normalize_mention_text(update.message.text, context)
@@ -3051,7 +3098,10 @@ BOT_COMMANDS = [
 
 
 async def _set_bot_commands(app: Application) -> None:
-    await app.bot.set_my_commands(BOT_COMMANDS)
+    # Private chats: show clean /command without @botname suffix
+    await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+    # Groups: no menu (avoids /command@botname clutter)
+    await app.bot.delete_my_commands()
 
 
 def build_application() -> Application:
