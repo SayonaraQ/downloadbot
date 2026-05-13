@@ -1002,6 +1002,8 @@ def _ytdlp_common_opts(outtmpl: str, cookiefile: str | None = None, proxy: str |
         "fragment_retries": 10,
         "extractor_retries": 3,
         "concurrent_fragment_downloads": 4,
+        "sleep_interval_requests": 1,
+        "retry_sleep_functions": {"http": lambda n: min(4 ** n, 60)},
         "max_filesize": MAX_SIZE_MB * 1024 * 1024,
     }
     if proxy:
