@@ -1989,6 +1989,26 @@ def _fmt_duration(seconds: int | float | None) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
+def _music_search_keyboard(session_id: str, candidates: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    """Build styled inline keyboard for music search results."""
+    keyboard = []
+    for i, c in enumerate(candidates):
+        is_sc = c.get("source") == "sc"
+        source_icon = "☁️" if is_sc else "🎵"
+        dur = _fmt_duration(c.get("duration"))
+        label = f"{source_icon} {c['title']}"
+        if c.get("channel"):
+            label += f" — {c['channel']}"
+        if dur:
+            label += f" [{dur}]"
+        keyboard.append([InlineKeyboardButton(
+            label[:64],
+            callback_data=f"mpick:{session_id}:{i}",
+            style="primary" if is_sc else "danger",
+        )])
+    return InlineKeyboardMarkup(keyboard)
+
+
 def _search_music_candidates(query: str, n: int, prefix: str = "ytsearch") -> list[dict[str, Any]]:
     opts = {
         "quiet": True,
@@ -2153,20 +2173,9 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     session_id = uuid.uuid4().hex[:12]
     _music_search_sessions[session_id] = candidates
 
-    keyboard = []
-    for i, c in enumerate(candidates):
-        source_icon = "☁️" if c.get("source") == "sc" else "🎵"
-        dur = _fmt_duration(c.get("duration"))
-        label = f"{source_icon} {c['title']}"
-        if c.get("channel"):
-            label += f" — {c['channel']}"
-        if dur:
-            label += f" [{dur}]"
-        keyboard.append([InlineKeyboardButton(label[:64], callback_data=f"mpick:{session_id}:{i}")])
-
     await status_msg.edit_text(
         f"Результаты по «{source}»:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=_music_search_keyboard(session_id, candidates),
     )
 
 
@@ -3010,19 +3019,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         return
                     session_id = uuid.uuid4().hex[:12]
                     _music_search_sessions[session_id] = candidates
-                    keyboard = []
-                    for i, c in enumerate(candidates):
-                        source_icon = "☁️" if c.get("source") == "sc" else "🎵"
-                        dur = _fmt_duration(c.get("duration"))
-                        label = f"{source_icon} {c['title']}"
-                        if c.get("channel"):
-                            label += f" — {c['channel']}"
-                        if dur:
-                            label += f" [{dur}]"
-                        keyboard.append([InlineKeyboardButton(label[:64], callback_data=f"mpick:{session_id}:{i}")])
                     await update.message.reply_text(
                         f"Результаты по «{source}»:",
-                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        reply_markup=_music_search_keyboard(session_id, candidates),
                     )
                 except Exception as e:
                     logger.error("Ошибка поиска через ForceReply: %s", e)
