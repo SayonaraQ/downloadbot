@@ -1804,6 +1804,50 @@ def _download_audio_with_cookie(
     }
 
 
+def _download_yandex_music_api(url: str, workdir: Path) -> dict[str, Any]:
+    """Download Yandex Music track via official API (avoids CDN rate limits)."""
+    try:
+        from yandex_music import Client as _YMClient
+    except ImportError:
+        raise RuntimeError("yandex-music не установлен")
+
+    client = _YMClient(YA_TOKEN).init()
+
+    track_id_m = re.search(r"/track/(\d+)", url)
+    if not track_id_m:
+        raise ValueError(f"Не удалось извлечь ID трека из URL: {url}")
+    track_id = track_id_m.group(1)
+
+    # album:track format may be needed; try plain track_id first
+    tracks = client.tracks([track_id])
+    if not tracks:
+        raise FileNotFoundError("Трек не найден через API")
+    track = tracks[0]
+
+    title = track.title or "Unknown"
+    performer = track.artists[0].name if track.artists else None
+    safe_name = re.sub(r'[\\/:*?"<>|]', "_", f"{performer} - {title}" if performer else title)
+    filepath = workdir / f"{safe_name}.mp3"
+
+    # Try 320kbps, fall back to best available
+    try:
+        track.download(str(filepath), codec="mp3", bitrate_in_kbps=320)
+    except Exception:
+        track.download(str(filepath))
+
+    if not filepath.exists() or filepath.stat().st_size == 0:
+        raise FileNotFoundError("Файл не скачался через API")
+
+    logger.info("[music:yandex_music] API download OK: %s", filepath.name)
+    return {
+        "title": title,
+        "site": "yandex_music",
+        "source_url": url,
+        "files": [str(filepath)],
+        "file_meta": [{"filename": filepath.name, "title": title, "performer": performer}],
+    }
+
+
 def download_audio_with_fallback(source: str, tmp_dir: Path) -> dict[str, Any]:
     """Download audio from supported URL or search YouTube by text."""
     source = re.sub(r"\s+", " ", source or "").strip()
@@ -1817,6 +1861,13 @@ def download_audio_with_fallback(source: str, tmp_dir: Path) -> dict[str, Any]:
     site = _audio_site_for_url(source_url) if source_url else "youtube_search"
     if site == "unknown":
         raise ValueError("Эта ссылка не поддерживается для скачивания музыки.")
+
+    # Yandex Music + token: use official API first (no CDN rate limits)
+    if site == "yandex_music" and source_url and YA_TOKEN:
+        try:
+            return _download_yandex_music_api(source_url, tmp_dir)
+        except Exception as e:
+            logger.warning("[music:yandex_music] API failed, falling back to yt-dlp: %s", e)
 
     cookie_files = _cookie_files_for_audio_site(site)
     attempts: list[str | None] = []
