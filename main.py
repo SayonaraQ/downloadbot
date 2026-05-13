@@ -124,6 +124,10 @@ WEBHOOK_SECRET_TOKEN = (os.getenv("WEBHOOK_SECRET_TOKEN") or "").strip()
 CACHE_DIR = Path(os.getenv("CACHE_DIR", str(DATA_DIR / "cache")))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 minutes by default
 CACHE_CLEAN_INTERVAL_SECONDS = int(os.getenv("CACHE_CLEAN_INTERVAL_SECONDS", "60"))
+INLINE_PREPARE_WAIT_SECONDS = max(
+    0.0,
+    min(8.0, float((os.getenv("INLINE_PREPARE_WAIT_SECONDS") or "4").strip() or "4")),
+)
 
 # Downloader limits
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "5"))
@@ -199,7 +203,7 @@ _last_success_cookie_lock = threading.Lock()
 
 # Inline cache warm-up tasks. Inline answers must be fast, so expensive downloads
 # are prepared in the background and served from Telegram file_id on the next query.
-_inline_prepare_tasks: set[str] = set()
+_inline_prepare_tasks: dict[str, asyncio.Task] = {}
 
 # -------------------------
 # URL patterns (keep strict behaviour: react only to supported domains)
@@ -643,6 +647,46 @@ def _stream_kinds_for_file(path: Path) -> tuple[bool, bool]:
     has_video = any(s.get("codec_type") == "video" for s in streams)
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
     return has_video, has_audio
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _video_upload_kwargs(path: Path | None) -> dict[str, int]:
+    if path is None:
+        return {}
+
+    try:
+        probe = _probe_media(path)
+    except Exception as e:
+        logger.warning("Не удалось определить metadata видео %s: %s", path.name, e)
+        return {}
+
+    if not probe:
+        return {}
+
+    streams = probe.get("streams") or []
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if not isinstance(video_stream, dict):
+        return {}
+
+    result: dict[str, int] = {}
+    width = _positive_int(video_stream.get("width"))
+    height = _positive_int(video_stream.get("height"))
+    if width and height:
+        result.update({"width": width, "height": height})
+
+    format_info = probe.get("format") or {}
+    duration = _positive_int(format_info.get("duration") or video_stream.get("duration"))
+    if duration:
+        result["duration"] = duration
+
+    return result
 
 
 def _select_primary_downloads(files: list[Path]) -> tuple[list[Path], list[Path]]:
@@ -1101,7 +1145,13 @@ async def _send_single_item(
             msg = await update.message.reply_photo(photo=f, caption=caption, parse_mode=parse_mode)
             return msg.photo[-1].file_id
         if kind == "video":
-            msg = await update.message.reply_video(video=f, caption=caption, parse_mode=parse_mode, supports_streaming=True)
+            msg = await update.message.reply_video(
+                video=f,
+                caption=caption,
+                parse_mode=parse_mode,
+                supports_streaming=True,
+                **_video_upload_kwargs(media_path),
+            )
             return msg.video.file_id
         if kind == "audio":
             msg = await update.message.reply_audio(audio=f, caption=caption, parse_mode=parse_mode, title=media_path.stem)
@@ -1200,7 +1250,13 @@ async def _send_media_group(
                 if kind == "photo":
                     media_group.append(InputMediaPhoto(media=input_file, caption=_cap(i), parse_mode=_pm(i)))
                 else:
-                    media_group.append(InputMediaVideo(media=input_file, caption=_cap(i), parse_mode=_pm(i), supports_streaming=True))
+                    media_group.append(InputMediaVideo(
+                        media=input_file,
+                        caption=_cap(i),
+                        parse_mode=_pm(i),
+                        supports_streaming=True,
+                        **_video_upload_kwargs(path),
+                    ))
 
             msgs = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
 
@@ -1884,7 +1940,12 @@ async def _upload_inline_cache_item(
             msg = await context.bot.send_photo(chat_id=chat_id, photo=f)
             return msg.photo[-1].file_id
         if kind == "video":
-            msg = await context.bot.send_video(chat_id=chat_id, video=f, supports_streaming=True)
+            msg = await context.bot.send_video(
+                chat_id=chat_id,
+                video=f,
+                supports_streaming=True,
+                **_video_upload_kwargs(path),
+            )
             return msg.video.file_id
         if kind == "audio":
             msg = await context.bot.send_audio(chat_id=chat_id, audio=f, title=path.stem)
@@ -2044,20 +2105,62 @@ async def _prepare_inline_cache_task(
     source: str,
     requester_id: int | None,
     upload_chat_id: int,
-) -> None:
+) -> dict[str, Any] | None:
+    current_task = asyncio.current_task()
     try:
         if not upload_chat_id:
-            return
+            return None
         async with sema:
             if kind == "audio":
                 entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
             else:
                 entry = await _get_or_download_media_entry(source, requester_id=requester_id)
             await _ensure_inline_file_ids(context, entry=entry, upload_chat_id=upload_chat_id)
+            return entry
     except Exception as e:
         logger.warning("Не удалось подготовить inline-кэш (%s): %s", kind, e)
+        return None
     finally:
-        _inline_prepare_tasks.discard(task_key)
+        if _inline_prepare_tasks.get(task_key) is current_task:
+            _inline_prepare_tasks.pop(task_key, None)
+
+
+def _inline_prepare_task_key(kind: str, source: str) -> str:
+    if kind == "audio":
+        audio_key = _cache_key("audio:" + _audio_cache_key_source(source))
+        return f"inline:audio:{audio_key}"
+    return f"inline:media:{_cache_key(source)}"
+
+
+def _get_or_schedule_inline_cache_prepare(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    kind: str,
+    source: str,
+    requester_id: int | None,
+    upload_chat_id: int,
+) -> tuple[bool, asyncio.Task | None]:
+    if not upload_chat_id:
+        return False, None
+
+    key = _inline_prepare_task_key(kind, source)
+
+    task = _inline_prepare_tasks.get(key)
+    if task and not task.done():
+        return True, task
+    if task:
+        _inline_prepare_tasks.pop(key, None)
+
+    task = context.application.create_task(_prepare_inline_cache_task(
+        context,
+        task_key=key,
+        kind=kind,
+        source=source,
+        requester_id=requester_id,
+        upload_chat_id=upload_chat_id,
+    ))
+    _inline_prepare_tasks[key] = task
+    return False, task
 
 
 def _schedule_inline_cache_prepare(
@@ -2068,28 +2171,38 @@ def _schedule_inline_cache_prepare(
     requester_id: int | None,
     upload_chat_id: int,
 ) -> bool:
-    if not upload_chat_id:
-        return False
-
-    if kind == "audio":
-        audio_key = _cache_key("audio:" + _audio_cache_key_source(source))
-        key = f"inline:audio:{audio_key}"
-    else:
-        key = f"inline:media:{_cache_key(source)}"
-
-    if key in _inline_prepare_tasks:
-        return True
-
-    _inline_prepare_tasks.add(key)
-    context.application.create_task(_prepare_inline_cache_task(
+    already_running, _ = _get_or_schedule_inline_cache_prepare(
         context,
-        task_key=key,
         kind=kind,
         source=source,
         requester_id=requester_id,
         upload_chat_id=upload_chat_id,
-    ))
-    return False
+    )
+    return already_running
+
+
+async def _wait_for_inline_prepared_entry(
+    *,
+    task: asyncio.Task | None,
+    kind: str,
+    source: str,
+    timeout: float,
+) -> dict[str, Any] | None:
+    if task is None or timeout <= 0:
+        return None
+
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except asyncio.TimeoutError:
+        return None
+    except Exception as e:
+        logger.warning("Не удалось дождаться inline-кэша (%s): %s", kind, e)
+        return None
+
+    entry = _cached_audio_entry(source) if kind == "audio" else _cached_media_entry(source)
+    if entry and _entry_has_inline_file_ids(entry):
+        return entry
+    return None
 
 
 def _extract_music_command_payload(text: str) -> str:
@@ -2309,13 +2422,24 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
                 return
 
-            already_running = _schedule_inline_cache_prepare(
+            already_running, prepare_task = _get_or_schedule_inline_cache_prepare(
                 context,
                 kind="audio",
                 source=music_source,
                 requester_id=requester_id,
                 upload_chat_id=upload_chat_id,
             )
+            entry = await _wait_for_inline_prepared_entry(
+                task=prepare_task,
+                kind="audio",
+                source=music_source,
+                timeout=INLINE_PREPARE_WAIT_SECONDS,
+            )
+            if entry and _entry_has_inline_file_ids(entry):
+                results = _inline_audio_results(entry)
+                await inline_query.answer(results[:50], cache_time=0, is_personal=True)
+                return
+
             title = "Уже готовлю аудио" if already_running else "Готовлю аудио"
             await inline_query.answer(
                 [_inline_article(
@@ -2355,13 +2479,26 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
-        already_running = _schedule_inline_cache_prepare(
+        already_running, prepare_task = _get_or_schedule_inline_cache_prepare(
             context,
             kind="media",
             source=video_url,
             requester_id=requester_id,
             upload_chat_id=upload_chat_id,
         )
+        entry = await _wait_for_inline_prepared_entry(
+            task=prepare_task,
+            kind="media",
+            source=video_url,
+            timeout=INLINE_PREPARE_WAIT_SECONDS,
+        )
+        if entry and _entry_has_inline_file_ids(entry):
+            results = _inline_media_results(entry)
+            if not results:
+                results = [_inline_article("Не удалось подготовить медиа", "Попробуй отправить ссылку боту напрямую.")]
+            await inline_query.answer(results[:50], cache_time=0, is_personal=True)
+            return
+
         title = "Уже готовлю медиа" if already_running else "Готовлю медиа"
         await inline_query.answer(
             [_inline_article(
