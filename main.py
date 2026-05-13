@@ -126,7 +126,7 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 minutes by d
 CACHE_CLEAN_INTERVAL_SECONDS = int(os.getenv("CACHE_CLEAN_INTERVAL_SECONDS", "60"))
 INLINE_PREPARE_WAIT_SECONDS = max(
     0.0,
-    min(8.0, float((os.getenv("INLINE_PREPARE_WAIT_SECONDS") or "4").strip() or "4")),
+    min(8.0, float((os.getenv("INLINE_PREPARE_WAIT_SECONDS") or "8").strip() or "8")),
 )
 
 # Downloader limits
