@@ -2734,48 +2734,19 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     video_url = _extract_supported_video_url(text)
 
     try:
-        # @bot /music <free text> → show multi-source search results
+        # @bot /music <free text> → single article that fires /music in chat,
+        # which shows the search keyboard directly in the conversation
         if music_source and has_music_prefix and not _looks_like_url(music_source) and len(music_source) >= 2:
-            try:
-                candidates = await asyncio.wait_for(
-                    _search_music_multi_async(music_source, MUSIC_SEARCH_RESULTS),
-                    timeout=7.0,
-                )
-            except asyncio.TimeoutError:
-                logger.warning("Inline music search timed out for query: %s", music_source)
-                await inline_query.answer(
-                    [_inline_article("Поиск занял слишком долго", "Попробуй повторить запрос чуть позже.")],
-                    cache_time=5,
-                    is_personal=True,
-                )
-                return
-            except Exception as e:
-                logger.warning("Inline music search failed: %s", e)
-                candidates = []
-
-            if not candidates:
-                await inline_query.answer(
-                    [_inline_article("Ничего не найдено", f"По запросу «{music_source}» ничего не нашлось.")],
-                    cache_time=10,
-                    is_personal=False,
-                )
-                return
-
-            results = []
-            for c in candidates:
-                source_icon = "☁️" if c.get("source") == "sc" else "🎵"
-                dur = _fmt_duration(c.get("duration"))
-                title = f"{source_icon} {c['title']}"
-                description = c.get("channel") or ""
-                if dur:
-                    description += f" · {dur}" if description else dur
-                results.append(InlineQueryResultArticle(
+            await inline_query.answer(
+                [InlineQueryResultArticle(
                     id=uuid.uuid4().hex,
-                    title=title[:64],
-                    description=description[:128],
-                    input_message_content=InputTextMessageContent(f"/ytmusic {c['url']}"),
-                ))
-            await inline_query.answer(results[:50], cache_time=30, is_personal=False)
+                    title=f"🔍 Найти: «{music_source[:50]}»",
+                    description="YouTube + SoundCloud — варианты появятся прямо в чате",
+                    input_message_content=InputTextMessageContent(f"/music {music_source}"),
+                )],
+                cache_time=30,
+                is_personal=False,
+            )
             return
 
         if music_source:
