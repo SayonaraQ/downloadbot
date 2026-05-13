@@ -1677,12 +1677,19 @@ def _download_audio_with_cookie(
     file_meta: list[dict[str, Any]] = []
     for p in selected_files:
         stem = p.stem
-        eid = stem.rsplit("_", 1)[-1] if "_" in stem else ""
-        entry = entries_by_id.get(eid)
+        # ID may contain underscores (e.g. YouTube IDs like "jaLOq_oML88"),
+        # so try joining more and more right-side parts until we find a match.
+        matched_entry = None
+        parts = stem.split("_")
+        for i in range(len(parts) - 1, 0, -1):
+            candidate = "_".join(parts[i:])
+            if candidate in entries_by_id:
+                matched_entry = entries_by_id[candidate]
+                break
         file_title = None
         performer = None
-        if entry:
-            file_title, performer = _audio_title_and_performer(entry)
+        if matched_entry:
+            file_title, performer = _audio_title_and_performer(matched_entry)
         file_meta.append({
             "filename": p.name,
             "title": file_title,
