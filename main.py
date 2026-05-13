@@ -228,7 +228,7 @@ SUPPORTED_AUDIO_URL_RE = re.compile(
 )
 
 # Simple music query: "Artist - Title" (existing behavior)
-MUSIC_PATTERN = re.compile(r"^(\w{2,}(\s+\w{2,}){0,3})\s+-\s+(\w{2,}(\s+\w{2,}){0,3})$")
+MUSIC_PATTERN = re.compile(r"^(\w{2,}(\s+\w+){0,3})\s+-\s+(\w{2,}(\s+\w+){0,3})$")
 
 
 # -------------------------
