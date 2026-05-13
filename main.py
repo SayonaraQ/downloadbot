@@ -2101,7 +2101,7 @@ def _music_search_keyboard(session_id: str, candidates: list[dict[str, Any]]) ->
             AD_KEYBOARD_TEXT,
             url=AD_URL,
             style="primary",
-            icon_custom_emoji_id="5215667984860718631",
+            icon_custom_emoji_id="5222337291682326712",
         )])
     return InlineKeyboardMarkup(keyboard)
 
