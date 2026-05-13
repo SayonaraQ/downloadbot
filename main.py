@@ -1469,6 +1469,65 @@ def _audio_entries_from_info(info: Any) -> list[dict[str, Any]]:
     return [entry for entry in _iter_entries(info) if isinstance(entry, dict)]
 
 
+_MUSIC_ANNOTATION_RE = re.compile(
+    r"\s*[\(\[\{][^()\[\]{}]*\b("
+    r"official|lyric|lyrics|audio|video|visual|visualizer|"
+    r"music|клип|официальн\w*|премьер\w*|hd|4k|hq|mv|"
+    r"live|remix|cover|version|remaster\w*|extended|edit"
+    r")\b[^()\[\]{}]*[\)\]\}]",
+    re.I,
+)
+_MUSIC_SPLIT_RE = re.compile(r"^\s*(?P<artist>.+?)\s+[\-–—]\s+(?P<track>.+?)\s*$")
+
+
+def _clean_music_annotations(text: str | None) -> str:
+    if not text:
+        return ""
+    cleaned = _MUSIC_ANNOTATION_RE.sub("", text)
+    return re.sub(r"\s+", " ", cleaned).strip(" -–—:|")
+
+
+def _parse_artist_track(title: str | None) -> tuple[str | None, str | None]:
+    """Best-effort split of a music-video title into (artist, track)."""
+    cleaned = _clean_music_annotations(title)
+    if not cleaned:
+        return None, None
+    m = _MUSIC_SPLIT_RE.match(cleaned)
+    if not m:
+        return None, None
+    artist = m.group("artist").strip()
+    track = m.group("track").strip()
+    if not artist or not track:
+        return None, None
+    return artist, track
+
+
+def _audio_title_and_performer(entry: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Pick a clean (title, performer) for Telegram audio metadata.
+
+    Prefers yt-dlp's structured fields (track/artist), then parses
+    "Artist - Track" out of the video title and strips noise like
+    "(Official Video)". Only falls back to channel/uploader when the
+    title cannot be parsed — otherwise channel names like
+    "Официальный канал группы X" duplicate the artist.
+    """
+    track = (entry.get("track") or "").strip() or None
+    artist = (entry.get("artist") or entry.get("creator") or "").strip() or None
+    original_title = entry.get("title") or ""
+
+    parsed_artist, parsed_track = (None, None)
+    if not (track and artist):
+        parsed_artist, parsed_track = _parse_artist_track(original_title)
+
+    file_title = track or parsed_track or _clean_music_annotations(original_title) or (original_title or None)
+    performer = artist or parsed_artist
+    if not performer and not parsed_track:
+        uploader = (entry.get("uploader") or entry.get("channel") or "").strip()
+        performer = uploader or None
+
+    return file_title, performer
+
+
 def _select_audio_downloads(files: list[Path]) -> list[Path]:
     audio_files: list[Path] = []
     other_files: list[Path] = []
@@ -1617,13 +1676,7 @@ def _download_audio_with_cookie(
         file_title = None
         performer = None
         if entry:
-            file_title = entry.get("track") or entry.get("title")
-            performer = (
-                entry.get("artist")
-                or entry.get("creator")
-                or entry.get("uploader")
-                or entry.get("channel")
-            )
+            file_title, performer = _audio_title_and_performer(entry)
         file_meta.append({
             "filename": p.name,
             "title": file_title,
