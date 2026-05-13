@@ -156,6 +156,8 @@ YA_COOKIES_FILES = os.getenv("YA_COOKIES_FILES") or os.getenv("YA_COOKIES_FILE")
 AD_URL = (os.getenv("AD_URL") or "").strip() or None
 AD_KEYBOARD_TEXT = (os.getenv("AD_KEYBOARD_TEXT") or "").strip() or None
 AD_TRACK_TEXT = (os.getenv("AD_TRACK_TEXT") or "").strip() or None
+AD_TRACK_EMOJI_LEFT = (os.getenv("AD_TRACK_EMOJI_LEFT") or "").strip() or None
+AD_TRACK_EMOJI_RIGHT = (os.getenv("AD_TRACK_EMOJI_RIGHT") or "").strip() or None
 AD_TRACK_DELAY_SEC = max(1, int(os.getenv("AD_TRACK_DELAY_SEC", "10")))
 
 # Audio extraction
@@ -1460,7 +1462,8 @@ async def send_cache_entry(
         if use_caption:
             # Direct send to get full message object (need message_id for later edit)
             caption_used = True
-            ak: dict[str, Any] = {"caption": use_caption, "parse_mode": "Markdown"}
+            ad = _build_ad_caption()
+            ak: dict[str, Any] = {"caption": ad[0] if ad else use_caption, "parse_mode": ad[1] if ad else "Markdown"}
             if audio_title:
                 ak["title"] = audio_title
             if audio_performer:
@@ -2072,6 +2075,21 @@ async def _delete_message_after(bot: Any, chat_id: int, message_id: int, delay: 
         pass
 
 
+def _build_ad_caption() -> tuple[str, str] | None:
+    """Return (text, parse_mode) for the ad track caption, or None if ads disabled."""
+    if not AD_TRACK_TEXT:
+        return None
+    if AD_TRACK_EMOJI_LEFT or AD_TRACK_EMOJI_RIGHT:
+        # Convert [text](url) Markdown links to HTML <a> tags
+        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', AD_TRACK_TEXT)
+        if AD_TRACK_EMOJI_LEFT:
+            text = f'<tg-emoji emoji-id="{AD_TRACK_EMOJI_LEFT}">⭐</tg-emoji> {text}'
+        if AD_TRACK_EMOJI_RIGHT:
+            text = f'{text} <tg-emoji emoji-id="{AD_TRACK_EMOJI_RIGHT}">⭐</tg-emoji>'
+        return text, "HTML"
+    return AD_TRACK_TEXT, "Markdown"
+
+
 async def _remove_caption_after(bot: Any, chat_id: int, message_id: int, delay: float) -> None:
     """Edit audio caption to empty after delay (removes ad text, keeps the track)."""
     await asyncio.sleep(delay)
@@ -2102,7 +2120,7 @@ def _music_search_keyboard(session_id: str, candidates: list[dict[str, Any]]) ->
             AD_KEYBOARD_TEXT,
             url=AD_URL,
             style="primary",
-            icon_custom_emoji_id="5215667984860718631",
+            icon_custom_emoji_id="5215375201235117680",
         )])
     return InlineKeyboardMarkup(keyboard)
 
@@ -2199,7 +2217,7 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await cq.delete_message()
 
-    ad_caption = AD_TRACK_TEXT or None
+    ad = _build_ad_caption()
     caption_scheduled = False
 
     for it in items:
@@ -2211,9 +2229,9 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if it.get("performer"):
             audio_kwargs["performer"] = it["performer"]
         # Attach ad as caption to the first audio only
-        if ad_caption and not caption_scheduled:
-            audio_kwargs["caption"] = ad_caption
-            audio_kwargs["parse_mode"] = "Markdown"
+        if ad and not caption_scheduled:
+            audio_kwargs["caption"] = ad[0]
+            audio_kwargs["parse_mode"] = ad[1]
         tg_file_id = it.get("tg_file_id")
         if tg_file_id:
             msg = await context.bot.send_audio(chat_id=chat_id, audio=tg_file_id, **audio_kwargs)
@@ -2228,7 +2246,7 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             with p.open("rb") as f:
                 msg = await context.bot.send_audio(chat_id=chat_id, audio=f, **audio_kwargs)
             it["tg_file_id"] = msg.audio.file_id
-        if ad_caption and not caption_scheduled:
+        if ad and not caption_scheduled:
             asyncio.create_task(_remove_caption_after(context.bot, chat_id, msg.message_id, AD_TRACK_DELAY_SEC))
             caption_scheduled = True
 
@@ -2313,8 +2331,9 @@ async def ytmusic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     async with sema:
         try:
             entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
-            msg_id = await send_cache_entry(update, context, entry, audio_caption=AD_TRACK_TEXT or None)
-            if msg_id and AD_TRACK_TEXT:
+            ad = _build_ad_caption()
+            msg_id = await send_cache_entry(update, context, entry, audio_caption=ad[0] if ad else None)
+            if msg_id and ad:
                 asyncio.create_task(_remove_caption_after(
                     context.bot, update.message.chat_id, msg_id, AD_TRACK_DELAY_SEC,
                 ))
