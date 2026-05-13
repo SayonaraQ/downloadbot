@@ -1808,10 +1808,13 @@ def _download_yandex_music_api(url: str, workdir: Path) -> dict[str, Any]:
     """Download Yandex Music track via official API (avoids CDN rate limits)."""
     try:
         from yandex_music import Client as _YMClient
+        from yandex_music.utils.request import Request as _YMRequest
     except ImportError:
         raise RuntimeError("yandex-music не установлен")
 
-    client = _YMClient(YA_TOKEN).init()
+    proxy = YA_PROXY or RU_PROXY
+    request = _YMRequest(proxy_url=proxy) if proxy else None
+    client = _YMClient(YA_TOKEN, request=request).init()
 
     track_id_m = re.search(r"/track/(\d+)", url)
     if not track_id_m:
