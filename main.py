@@ -152,6 +152,12 @@ YA_PROXY = (os.getenv("YA_PROXY") or os.getenv("YANDEX_MUSIC_PROXY") or RU_PROXY
 YA_TOKEN = (os.getenv("YA_TOKEN") or "").strip() or None
 YA_COOKIES_FILES = os.getenv("YA_COOKIES_FILES") or os.getenv("YA_COOKIES_FILE")
 
+# Ad / promo
+AD_URL = (os.getenv("AD_URL") or "").strip() or None
+AD_KEYBOARD_TEXT = (os.getenv("AD_KEYBOARD_TEXT") or "").strip() or None
+AD_TRACK_TEXT = (os.getenv("AD_TRACK_TEXT") or "").strip() or None
+AD_TRACK_DELAY_SEC = max(1, int(os.getenv("AD_TRACK_DELAY_SEC", "10")))
+
 # Audio extraction
 AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "bestaudio/best")
 AUDIO_CODEC = os.getenv("AUDIO_CODEC", "mp3").strip() or "mp3"
@@ -2049,6 +2055,26 @@ _YT_ICON_EMOJI_ID = "5334681713316479679"
 _SC_ICON_EMOJI_ID = "5345844509412444249"
 
 
+async def _delete_message_after(bot: Any, chat_id: int, message_id: int, delay: float) -> None:
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def _send_ad_message(bot: Any, chat_id: int) -> None:
+    """Send promo message and delete it after AD_TRACK_DELAY_SEC."""
+    if not AD_TRACK_TEXT:
+        return
+    try:
+        msg = await bot.send_message(chat_id=chat_id, text=AD_TRACK_TEXT, parse_mode="Markdown",
+                                     disable_web_page_preview=True)
+        asyncio.create_task(_delete_message_after(bot, chat_id, msg.message_id, AD_TRACK_DELAY_SEC))
+    except Exception:
+        pass
+
+
 def _music_search_keyboard(session_id: str, candidates: list[dict[str, Any]]) -> InlineKeyboardMarkup:
     """Build styled inline keyboard for music search results."""
     keyboard = []
@@ -2066,6 +2092,8 @@ def _music_search_keyboard(session_id: str, candidates: list[dict[str, Any]]) ->
             style="primary" if is_sc else "success",
             icon_custom_emoji_id=_SC_ICON_EMOJI_ID if is_sc else _YT_ICON_EMOJI_ID,
         )])
+    if AD_URL and AD_KEYBOARD_TEXT:
+        keyboard.append([InlineKeyboardButton(AD_KEYBOARD_TEXT, url=AD_URL)])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -2185,6 +2213,7 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             it["tg_file_id"] = msg.audio.file_id
 
     _write_cache_entry(entry)
+    await _send_ad_message(context.bot, chat_id)
 
 
 async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2266,6 +2295,7 @@ async def ytmusic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
             await send_cache_entry(update, context, entry)
+            await _send_ad_message(context.bot, update.message.chat_id)
         except ValueError as e:
             await update.message.reply_text(str(e))
         except Exception as e:
