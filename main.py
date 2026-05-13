@@ -124,7 +124,10 @@ WEBHOOK_SECRET_TOKEN = (os.getenv("WEBHOOK_SECRET_TOKEN") or "").strip()
 
 # Cache settings
 CACHE_DIR = Path(os.getenv("CACHE_DIR", str(DATA_DIR / "cache")))
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 minutes by default
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # local-file TTL before tg_file_id (5 min)
+CACHE_TTL_AUDIO_DAYS = int(os.getenv("CACHE_TTL_AUDIO_DAYS", "30"))
+CACHE_TTL_VIDEO_DAYS = int(os.getenv("CACHE_TTL_VIDEO_DAYS", "7"))
+CACHE_MAX_SIZE_MB = int(os.getenv("CACHE_MAX_SIZE_MB", "20000"))  # 20 GB soft limit
 CACHE_CLEAN_INTERVAL_SECONDS = int(os.getenv("CACHE_CLEAN_INTERVAL_SECONDS", "60"))
 INLINE_PREPARE_WAIT_SECONDS = max(
     0.0,
@@ -500,20 +503,22 @@ def _purge_cache_entry(key: str) -> None:
 
 
 def cleanup_cache() -> int:
-    """Delete expired cache entries. Returns deleted count."""
+    """Delete expired cache entries and enforce size limit. Returns deleted count."""
     deleted = 0
-    # from memory
+
+    # 1. TTL-based cleanup (memory)
     for key in list(_cache_index.keys()):
         if _is_entry_expired(_cache_index[key]):
             _purge_cache_entry(key)
             deleted += 1
 
-    # also remove any expired leftovers on disk
+    # 2. TTL-based cleanup (disk leftovers)
     for d in list(CACHE_DIR.iterdir()):
         if not d.is_dir():
             continue
         meta_path = d / "meta.json"
         if not meta_path.exists():
+            shutil.rmtree(d, ignore_errors=True)
             continue
         try:
             entry = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -521,8 +526,40 @@ def cleanup_cache() -> int:
                 shutil.rmtree(d, ignore_errors=True)
                 deleted += 1
         except Exception:
-            # if meta is broken, remove after ttl window
             pass
+
+    # 3. Size-based eviction: if total cache exceeds CACHE_MAX_SIZE_MB
+    if CACHE_MAX_SIZE_MB > 0:
+        max_bytes = CACHE_MAX_SIZE_MB * 1024 * 1024
+        total = _cache_total_size_bytes()
+        if total > max_bytes:
+            # Evict order: entries without tg_file_ids first (heavy local files),
+            # then oldest-first within each group.
+            candidates = sorted(
+                _cache_index.values(),
+                key=lambda e: (
+                    1 if _entry_all_have_file_ids(e) else 0,
+                    float(e.get("created_at", 0)),
+                ),
+            )
+            for entry in candidates:
+                if total <= max_bytes:
+                    break
+                key = str(entry.get("key") or "")
+                if not key:
+                    continue
+                entry_dir = _cache_dir_for_key(key)
+                try:
+                    entry_size = sum(
+                        f.stat().st_size for f in entry_dir.rglob("*") if f.is_file()
+                    )
+                except Exception:
+                    entry_size = 0
+                _purge_cache_entry(key)
+                total -= entry_size
+                deleted += 1
+            if deleted:
+                logger.info("Кэш: size-eviction удалил записей из-за превышения %d MB", CACHE_MAX_SIZE_MB)
 
     return deleted
 
@@ -574,6 +611,49 @@ def _cache_entry_is_usable(entry: dict[str, Any]) -> bool:
         if not (d / fn).exists():
             return False
     return True
+
+
+def _entry_all_have_file_ids(entry: dict[str, Any]) -> bool:
+    items = entry.get("items") or []
+    return bool(items) and all(
+        isinstance(it, dict) and bool(it.get("tg_file_id")) for it in items
+    )
+
+
+def _entry_media_kind(entry: dict[str, Any]) -> str:
+    """Returns 'audio' if all items are audio, else 'video'."""
+    items = entry.get("items") or []
+    kinds = {it.get("kind") for it in items if isinstance(it, dict) and it.get("kind")}
+    return "audio" if kinds and kinds <= {"audio"} else "video"
+
+
+def _delete_entry_local_files(entry: dict[str, Any]) -> None:
+    """Delete local media files for an entry (keep meta.json)."""
+    key = str(entry.get("key") or "")
+    if not key:
+        return
+    d = _cache_dir_for_key(key)
+    for it in entry.get("items") or []:
+        fn = it.get("local_filename") if isinstance(it, dict) else None
+        if fn:
+            try:
+                (d / fn).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _cache_total_size_bytes() -> int:
+    total = 0
+    try:
+        for f in CACHE_DIR.rglob("*"):
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return total
 
 
 def _classify_file(path: Path) -> str:
@@ -1110,6 +1190,14 @@ def _write_cache_entry(entry: dict[str, Any]) -> None:
     key = str(entry["key"])
     d = _cache_dir_for_key(key)
     d.mkdir(parents=True, exist_ok=True)
+
+    # Once all items are uploaded to Telegram: extend TTL and free local files.
+    if _entry_all_have_file_ids(entry):
+        kind = _entry_media_kind(entry)
+        long_ttl = (CACHE_TTL_AUDIO_DAYS if kind == "audio" else CACHE_TTL_VIDEO_DAYS) * 86400
+        entry["expires_at"] = _now() + long_ttl
+        _delete_entry_local_files(entry)
+
     _meta_path_for_key(key).write_text(json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8")
     _cache_index[key] = entry
 
