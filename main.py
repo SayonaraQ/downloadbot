@@ -1115,6 +1115,8 @@ async def _send_single_item(
     media: str | Path,
     caption: str | None,
     parse_mode: str | None = None,
+    audio_title: str | None = None,
+    audio_performer: str | None = None,
 ) -> str:
     """Send one media item. Returns Telegram file_id."""
     chat_id = update.effective_chat.id
@@ -1123,6 +1125,15 @@ async def _send_single_item(
         media_path = media
     else:
         media_path = None
+
+    audio_kwargs: dict[str, Any] = {}
+    if kind == "audio":
+        if audio_title:
+            audio_kwargs["title"] = audio_title
+        elif media_path is not None:
+            audio_kwargs["title"] = media_path.stem
+        if audio_performer:
+            audio_kwargs["performer"] = audio_performer
 
     # If media is a Telegram file_id (string), send directly
     if media_path is None and isinstance(media, str) and not os.path.exists(media):
@@ -1133,7 +1144,7 @@ async def _send_single_item(
             msg = await context.bot.send_video(chat_id=chat_id, video=media, caption=caption, parse_mode=parse_mode, supports_streaming=True)
             return msg.video.file_id
         if kind == "audio":
-            msg = await context.bot.send_audio(chat_id=chat_id, audio=media, caption=caption, parse_mode=parse_mode)
+            msg = await context.bot.send_audio(chat_id=chat_id, audio=media, caption=caption, parse_mode=parse_mode, **audio_kwargs)
             return msg.audio.file_id
         msg = await context.bot.send_document(chat_id=chat_id, document=media, caption=caption, parse_mode=parse_mode)
         return msg.document.file_id
@@ -1154,7 +1165,7 @@ async def _send_single_item(
             )
             return msg.video.file_id
         if kind == "audio":
-            msg = await update.message.reply_audio(audio=f, caption=caption, parse_mode=parse_mode, title=media_path.stem)
+            msg = await update.message.reply_audio(audio=f, caption=caption, parse_mode=parse_mode, **audio_kwargs)
             return msg.audio.file_id
         msg = await update.message.reply_document(document=f, caption=caption, parse_mode=parse_mode)
         return msg.document.file_id
@@ -1306,6 +1317,8 @@ async def send_cache_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, e
             "kind": kind,
             "tg_file_id": tg_file_id,
             "abs_path": abs_path,
+            "title": it.get("title"),
+            "performer": it.get("performer"),
         })
 
     caption = None
@@ -1328,12 +1341,30 @@ async def send_cache_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         kind = it["kind"]
         tg_file_id = it.get("tg_file_id")
         abs_path = it.get("abs_path")
+        audio_title = it.get("title") if kind == "audio" else None
+        audio_performer = it.get("performer") if kind == "audio" else None
 
         # Prefer tg file_id
         if tg_file_id:
-            fid = await _send_single_item(update, context, kind=kind, media=tg_file_id, caption=caption if i == 0 else None)
+            fid = await _send_single_item(
+                update,
+                context,
+                kind=kind,
+                media=tg_file_id,
+                caption=caption if i == 0 else None,
+                audio_title=audio_title,
+                audio_performer=audio_performer,
+            )
         else:
-            fid = await _send_single_item(update, context, kind=kind, media=Path(abs_path), caption=caption if i == 0 else None)
+            fid = await _send_single_item(
+                update,
+                context,
+                kind=kind,
+                media=Path(abs_path),
+                caption=caption if i == 0 else None,
+                audio_title=audio_title,
+                audio_performer=audio_performer,
+            )
 
         if fid:
             items[i]["tg_file_id"] = fid
@@ -1570,11 +1601,41 @@ def _download_audio_with_cookie(
     except Exception:
         title = None
 
+    entries_by_id: dict[str, dict[str, Any]] = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        eid = str(e.get("id") or "")
+        if eid:
+            entries_by_id[eid] = e
+
+    file_meta: list[dict[str, Any]] = []
+    for p in selected_files:
+        stem = p.stem
+        eid = stem.rsplit("_", 1)[-1] if "_" in stem else ""
+        entry = entries_by_id.get(eid)
+        file_title = None
+        performer = None
+        if entry:
+            file_title = entry.get("track") or entry.get("title")
+            performer = (
+                entry.get("artist")
+                or entry.get("creator")
+                or entry.get("uploader")
+                or entry.get("channel")
+            )
+        file_meta.append({
+            "filename": p.name,
+            "title": file_title,
+            "performer": performer,
+        })
+
     return {
         "title": title,
         "site": site,
         "source_url": target if source_url else None,
         "files": [str(p) for p in selected_files],
+        "file_meta": file_meta,
     }
 
 
@@ -1671,11 +1732,15 @@ async def _get_or_download_audio_entry(
         try:
             result = await asyncio.to_thread(download_audio_with_fallback, source, tmp_dir)
             files = [Path(p) for p in result["files"]]
+            meta_by_filename: dict[str, dict[str, Any]] = {
+                str(m.get("filename")): m for m in (result.get("file_meta") or []) if isinstance(m, dict)
+            }
             cache_dir = _cache_dir_for_key(key)
             cache_dir.mkdir(parents=True, exist_ok=True)
 
             items: list[dict[str, Any]] = []
             for p in files:
+                meta = meta_by_filename.get(p.name, {})
                 target = cache_dir / p.name
                 if target.exists():
                     target = cache_dir / f"{p.stem}_{int(_now())}{p.suffix}"
@@ -1684,7 +1749,8 @@ async def _get_or_download_audio_entry(
                     "kind": "audio",
                     "local_filename": target.name,
                     "tg_file_id": None,
-                    "title": target.stem,
+                    "title": meta.get("title") or target.stem,
+                    "performer": meta.get("performer"),
                 })
 
             entry = {
@@ -1934,6 +2000,8 @@ async def _upload_inline_cache_item(
     chat_id: int,
     kind: str,
     path: Path,
+    audio_title: str | None = None,
+    audio_performer: str | None = None,
 ) -> str:
     with path.open("rb") as f:
         if kind == "photo":
@@ -1948,7 +2016,10 @@ async def _upload_inline_cache_item(
             )
             return msg.video.file_id
         if kind == "audio":
-            msg = await context.bot.send_audio(chat_id=chat_id, audio=f, title=path.stem)
+            audio_kwargs: dict[str, Any] = {"title": audio_title or path.stem}
+            if audio_performer:
+                audio_kwargs["performer"] = audio_performer
+            msg = await context.bot.send_audio(chat_id=chat_id, audio=f, **audio_kwargs)
             return msg.audio.file_id
         msg = await context.bot.send_document(chat_id=chat_id, document=f)
         return msg.document.file_id
@@ -1972,11 +2043,14 @@ async def _ensure_inline_file_ids(
         path = cache_dir / local_filename
         if not path.exists() or not path.is_file():
             continue
+        kind = item.get("kind") or "document"
         item["tg_file_id"] = await _upload_inline_cache_item(
             context,
             chat_id=upload_chat_id,
-            kind=item.get("kind") or "document",
+            kind=kind,
             path=path,
+            audio_title=item.get("title") if kind == "audio" else None,
+            audio_performer=item.get("performer") if kind == "audio" else None,
         )
         changed = True
 
