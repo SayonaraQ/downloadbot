@@ -2727,28 +2727,12 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     upload_chat_id = INLINE_CACHE_CHAT_ID
     requester_id = inline_query.from_user.id if inline_query.from_user else None
-    has_music_prefix = bool(re.match(r"^/?music(?:@\w+)?(?:\s+|$)", text.strip(), re.I))
     music_source = _extract_inline_music_source(text)
     if not music_source and MUSIC_PATTERN.match(text):
         music_source = text
     video_url = _extract_supported_video_url(text)
 
     try:
-        # @bot /music <free text> → single article that fires /music in chat,
-        # which shows the search keyboard directly in the conversation
-        if music_source and has_music_prefix and not _looks_like_url(music_source) and len(music_source) >= 2:
-            await inline_query.answer(
-                [InlineQueryResultArticle(
-                    id=uuid.uuid4().hex,
-                    title=f"🔍 Найти: «{music_source[:50]}»",
-                    description="YouTube + SoundCloud — варианты появятся прямо в чате",
-                    input_message_content=InputTextMessageContent(f"/music {music_source}"),
-                )],
-                cache_time=30,
-                is_personal=False,
-            )
-            return
-
         if music_source:
             entry = _cached_audio_entry(music_source)
             if entry and _entry_has_inline_file_ids(entry):
