@@ -2737,7 +2737,18 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         # @bot /music <free text> → show multi-source search results
         if music_source and has_music_prefix and not _looks_like_url(music_source) and len(music_source) >= 2:
             try:
-                candidates = await _search_music_multi_async(music_source, MUSIC_SEARCH_RESULTS)
+                candidates = await asyncio.wait_for(
+                    _search_music_multi_async(music_source, MUSIC_SEARCH_RESULTS),
+                    timeout=7.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Inline music search timed out for query: %s", music_source)
+                await inline_query.answer(
+                    [_inline_article("Поиск занял слишком долго", "Попробуй повторить запрос чуть позже.")],
+                    cache_time=5,
+                    is_personal=True,
+                )
+                return
             except Exception as e:
                 logger.warning("Inline music search failed: %s", e)
                 candidates = []
@@ -2873,12 +2884,18 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             is_personal=True,
         )
     except Exception as e:
+        err_str = str(e)
         logger.error("Ошибка inline-запроса: %s", e)
-        await inline_query.answer(
-            [_inline_article("Не удалось загрузить", "Попробуй отправить ссылку боту напрямую или повторить позже.")],
-            cache_time=1,
-            is_personal=True,
-        )
+        if "query is too old" in err_str.lower() or "query id is invalid" in err_str.lower():
+            return
+        try:
+            await inline_query.answer(
+                [_inline_article("Не удалось загрузить", "Попробуй отправить ссылку боту напрямую или повторить позже.")],
+                cache_time=1,
+                is_personal=True,
+            )
+        except Exception:
+            pass
 
 
 async def _get_bot_username(context: ContextTypes.DEFAULT_TYPE) -> str | None:
