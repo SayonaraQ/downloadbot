@@ -33,6 +33,7 @@ from telegram import (
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
@@ -148,6 +149,7 @@ AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "bestaudio/best")
 AUDIO_CODEC = os.getenv("AUDIO_CODEC", "mp3").strip() or "mp3"
 AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "192").strip() or "192"
 AUDIO_SEARCH_PREFIX = os.getenv("AUDIO_SEARCH_PREFIX", "ytsearch1").strip() or "ytsearch1"
+MUSIC_SEARCH_RESULTS = max(1, min(10, int(os.getenv("MUSIC_SEARCH_RESULTS", "5"))))
 
 # Format selection (yt-dlp)
 DEFAULT_VIDEO_FORMAT = (
@@ -204,6 +206,9 @@ _last_success_cookie_lock = threading.Lock()
 # Inline cache warm-up tasks. Inline answers must be fast, so expensive downloads
 # are prepared in the background and served from Telegram file_id on the next query.
 _inline_prepare_tasks: dict[str, asyncio.Task] = {}
+
+# Pending /music search sessions: session_id -> list of candidate dicts
+_music_search_sessions: dict[str, list[dict[str, Any]]] = {}
 
 # -------------------------
 # URL patterns (keep strict behaviour: react only to supported domains)
@@ -1871,6 +1876,111 @@ async def pechenyuha_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+def _fmt_duration(seconds: int | float | None) -> str:
+    if not seconds:
+        return ""
+    s = int(seconds)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def _search_music_candidates(query: str, n: int) -> list[dict[str, Any]]:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+    }
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch{n}:{query}", download=False)
+    entries = (info or {}).get("entries") or []
+    results = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        vid_id = e.get("id") or ""
+        url = e.get("url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None)
+        if not url:
+            continue
+        results.append({
+            "url": url,
+            "title": e.get("title") or "Без названия",
+            "channel": e.get("channel") or e.get("uploader") or "",
+            "duration": e.get("duration"),
+        })
+    return results
+
+
+async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    if cq is None:
+        return
+    await cq.answer()
+
+    parts = (cq.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "mpick":
+        return
+
+    _, session_id, idx_str = parts
+    candidates = _music_search_sessions.get(session_id)
+    if not candidates:
+        await cq.edit_message_text("Результаты поиска устарели. Повтори /music запрос.")
+        return
+
+    try:
+        candidate = candidates[int(idx_str)]
+    except (ValueError, IndexError):
+        await cq.edit_message_text("Неверный выбор.")
+        return
+
+    url = candidate["url"]
+    title = candidate["title"]
+    chat_id = cq.message.chat_id
+    requester_id = cq.from_user.id if cq.from_user else None
+
+    await cq.edit_message_text(f"Скачиваю: {title}…")
+
+    async with sema:
+        try:
+            entry = await _get_or_download_audio_entry(url, requester_id=requester_id)
+        except Exception as e:
+            logger.error("Ошибка при загрузке трека по выбору: %s", e)
+            await cq.edit_message_text(f"Не удалось загрузить «{title}».")
+            return
+
+    _music_search_sessions.pop(session_id, None)
+
+    key = str(entry["key"])
+    d = _cache_dir_for_key(key)
+    items = entry.get("items") or []
+
+    await cq.delete_message()
+
+    for it in items:
+        if it.get("kind") != "audio":
+            continue
+        audio_kwargs: dict[str, Any] = {}
+        if it.get("title"):
+            audio_kwargs["title"] = it["title"]
+        if it.get("performer"):
+            audio_kwargs["performer"] = it["performer"]
+        tg_file_id = it.get("tg_file_id")
+        if tg_file_id:
+            msg = await context.bot.send_audio(chat_id=chat_id, audio=tg_file_id, **audio_kwargs)
+            it["tg_file_id"] = msg.audio.file_id
+        else:
+            local_fn = it.get("local_filename")
+            if not local_fn:
+                continue
+            p = d / local_fn
+            if not p.exists():
+                continue
+            with p.open("rb") as f:
+                msg = await context.bot.send_audio(chat_id=chat_id, audio=f, **audio_kwargs)
+            it["tg_file_id"] = msg.audio.file_id
+
+    _write_cache_entry(entry)
+
+
 async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.message.text is None:
         return
@@ -1878,7 +1988,7 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     source = _extract_music_command_payload(update.message.text)
     if not source:
         await update.message.reply_text(
-            "Пришли так: `/music https://youtu.be/...` или `/music Исполнитель - Название`.\n"
+            "Пришли так: `/music https://youtu.be/...` или `/music Gangsta Paradise`.\n"
             "Ещё подойдут ссылки Яндекс.Музыки и SoundCloud.",
             parse_mode="Markdown",
         )
@@ -1889,15 +1999,49 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     requester_id = update.effective_user.id if update.effective_user else None
 
-    async with sema:
-        try:
-            entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
-            await send_cache_entry(update, context, entry)
-        except ValueError as e:
-            await update.message.reply_text(str(e))
-        except Exception as e:
-            logger.error("Ошибка при загрузке музыки: %s", e)
-            await update.message.reply_text("Не удалось загрузить музыку.")
+    # URL → качаем напрямую
+    if _looks_like_url(source):
+        async with sema:
+            try:
+                entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
+                await send_cache_entry(update, context, entry)
+            except ValueError as e:
+                await update.message.reply_text(str(e))
+            except Exception as e:
+                logger.error("Ошибка при загрузке музыки: %s", e)
+                await update.message.reply_text("Не удалось загрузить музыку.")
+        return
+
+    # Свободный текст → поиск и выбор из результатов
+    status_msg = await update.message.reply_text("Ищу…")
+    try:
+        candidates = await asyncio.to_thread(_search_music_candidates, source, MUSIC_SEARCH_RESULTS)
+    except Exception as e:
+        logger.error("Ошибка поиска музыки: %s", e)
+        await status_msg.edit_text("Не удалось выполнить поиск.")
+        return
+
+    if not candidates:
+        await status_msg.edit_text("Ничего не найдено.")
+        return
+
+    session_id = uuid.uuid4().hex[:12]
+    _music_search_sessions[session_id] = candidates
+
+    keyboard = []
+    for i, c in enumerate(candidates):
+        dur = _fmt_duration(c.get("duration"))
+        label = c["title"]
+        if c.get("channel"):
+            label += f" — {c['channel']}"
+        if dur:
+            label += f" [{dur}]"
+        keyboard.append([InlineKeyboardButton(label[:64], callback_data=f"mpick:{session_id}:{i}")])
+
+    await status_msg.edit_text(
+        f"Результаты по «{source}»:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def handle_cookie_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2750,6 +2894,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("users", get_users_count))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("music", music_command))
+    app.add_handler(CallbackQueryHandler(music_pick_callback, pattern=r"^mpick:"))
     app.add_handler(TypeHandler(Update, handle_guest_update), group=-1)
     app.add_handler(InlineQueryHandler(handle_inline_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_cookie_document))
