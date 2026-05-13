@@ -1406,44 +1406,47 @@ async def _send_media_group(
     return out
 
 
-async def send_cache_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, entry: dict[str, Any]) -> None:
-    """Send cached media and update cached Telegram file_ids."""
+async def send_cache_entry(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    entry: dict[str, Any],
+    *,
+    audio_caption: str | None = None,
+) -> int | None:
+    """Send cached media and update cached Telegram file_ids.
+    Returns message_id of the first audio sent with audio_caption (for later caption removal).
+    """
     key = str(entry["key"])
     d = _cache_dir_for_key(key)
     items = entry.get("items") or []
 
-    # Build normalized items for sending
     send_items: list[dict[str, Any]] = []
     for it in items:
         local_fn = it.get("local_filename")
         abs_path = str(d / local_fn) if local_fn else None
-        kind = it.get("kind")
-        tg_file_id = it.get("tg_file_id")
-
         send_items.append({
-            "kind": kind,
-            "tg_file_id": tg_file_id,
+            "kind": it.get("kind"),
+            "tg_file_id": it.get("tg_file_id"),
             "abs_path": abs_path,
             "title": it.get("title"),
             "performer": it.get("performer"),
         })
 
-    caption = None
+    first_audio_message_id: int | None = None
+    caption_used = False
 
-    # If multiple photo/video items (<=10), use album
+    # Multiple photo/video → album
     album_candidates = [x for x in send_items if x["kind"] in {"photo", "video"}]
-    all_album_ok = (len(album_candidates) == len(send_items))
-
-    if all_album_ok and 1 < len(send_items) <= 10:
-        file_ids = await _send_media_group(update, context, items=send_items, caption=caption)
-        # Update file_ids
+    if len(album_candidates) == len(send_items) and 1 < len(send_items) <= 10:
+        file_ids = await _send_media_group(update, context, items=send_items, caption=None)
         for i, fid in enumerate(file_ids):
             if fid:
                 items[i]["tg_file_id"] = fid
         _write_cache_entry(entry)
-        return
+        return None
 
-    # Otherwise send one by one
+    chat_id = update.effective_chat.id
+
     for i, it in enumerate(send_items):
         kind = it["kind"]
         tg_file_id = it.get("tg_file_id")
@@ -1451,32 +1454,38 @@ async def send_cache_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, e
         audio_title = it.get("title") if kind == "audio" else None
         audio_performer = it.get("performer") if kind == "audio" else None
 
-        # Prefer tg file_id
-        if tg_file_id:
-            fid = await _send_single_item(
-                update,
-                context,
-                kind=kind,
-                media=tg_file_id,
-                caption=caption if i == 0 else None,
-                audio_title=audio_title,
-                audio_performer=audio_performer,
-            )
+        # First audio item gets the ad caption; others get no caption
+        use_caption = audio_caption if (kind == "audio" and audio_caption and not caption_used) else None
+
+        if use_caption:
+            # Direct send to get full message object (need message_id for later edit)
+            caption_used = True
+            ak: dict[str, Any] = {"caption": use_caption, "parse_mode": "Markdown"}
+            if audio_title:
+                ak["title"] = audio_title
+            if audio_performer:
+                ak["performer"] = audio_performer
+            if tg_file_id:
+                msg = await context.bot.send_audio(chat_id=chat_id, audio=tg_file_id, **ak)
+            else:
+                with open(abs_path, "rb") as f:
+                    msg = await context.bot.send_audio(chat_id=chat_id, audio=f, **ak)
+            items[i]["tg_file_id"] = msg.audio.file_id
+            first_audio_message_id = msg.message_id
         else:
             fid = await _send_single_item(
-                update,
-                context,
+                update, context,
                 kind=kind,
-                media=Path(abs_path),
-                caption=caption if i == 0 else None,
+                media=tg_file_id if tg_file_id else Path(abs_path),
+                caption=None,
                 audio_title=audio_title,
                 audio_performer=audio_performer,
             )
-
-        if fid:
-            items[i]["tg_file_id"] = fid
+            if fid:
+                items[i]["tg_file_id"] = fid
 
     _write_cache_entry(entry)
+    return first_audio_message_id
 
 
 # -------------------------
@@ -2063,14 +2072,11 @@ async def _delete_message_after(bot: Any, chat_id: int, message_id: int, delay: 
         pass
 
 
-async def _send_ad_message(bot: Any, chat_id: int) -> None:
-    """Send promo message and delete it after AD_TRACK_DELAY_SEC."""
-    if not AD_TRACK_TEXT:
-        return
+async def _remove_caption_after(bot: Any, chat_id: int, message_id: int, delay: float) -> None:
+    """Edit audio caption to empty after delay (removes ad text, keeps the track)."""
+    await asyncio.sleep(delay)
     try:
-        msg = await bot.send_message(chat_id=chat_id, text=AD_TRACK_TEXT, parse_mode="Markdown",
-                                     disable_web_page_preview=True)
-        asyncio.create_task(_delete_message_after(bot, chat_id, msg.message_id, AD_TRACK_DELAY_SEC))
+        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption="")
     except Exception:
         pass
 
@@ -2189,6 +2195,9 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await cq.delete_message()
 
+    ad_caption = AD_TRACK_TEXT or None
+    caption_scheduled = False
+
     for it in items:
         if it.get("kind") != "audio":
             continue
@@ -2197,6 +2206,10 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             audio_kwargs["title"] = it["title"]
         if it.get("performer"):
             audio_kwargs["performer"] = it["performer"]
+        # Attach ad as caption to the first audio only
+        if ad_caption and not caption_scheduled:
+            audio_kwargs["caption"] = ad_caption
+            audio_kwargs["parse_mode"] = "Markdown"
         tg_file_id = it.get("tg_file_id")
         if tg_file_id:
             msg = await context.bot.send_audio(chat_id=chat_id, audio=tg_file_id, **audio_kwargs)
@@ -2211,9 +2224,11 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             with p.open("rb") as f:
                 msg = await context.bot.send_audio(chat_id=chat_id, audio=f, **audio_kwargs)
             it["tg_file_id"] = msg.audio.file_id
+        if ad_caption and not caption_scheduled:
+            asyncio.create_task(_remove_caption_after(context.bot, chat_id, msg.message_id, AD_TRACK_DELAY_SEC))
+            caption_scheduled = True
 
     _write_cache_entry(entry)
-    await _send_ad_message(context.bot, chat_id)
 
 
 async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2294,8 +2309,11 @@ async def ytmusic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     async with sema:
         try:
             entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
-            await send_cache_entry(update, context, entry)
-            await _send_ad_message(context.bot, update.message.chat_id)
+            msg_id = await send_cache_entry(update, context, entry, audio_caption=AD_TRACK_TEXT or None)
+            if msg_id and AD_TRACK_TEXT:
+                asyncio.create_task(_remove_caption_after(
+                    context.bot, update.message.chat_id, msg_id, AD_TRACK_DELAY_SEC,
+                ))
         except ValueError as e:
             await update.message.reply_text(str(e))
         except Exception as e:
