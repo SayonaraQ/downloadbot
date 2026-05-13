@@ -2519,7 +2519,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = inline_query.query.strip()
     if not text:
         await inline_query.answer(
-            [_inline_article("Вставь ссылку", "Напиши: @bot ссылка на Instagram, TikTok, YouTube, VK, SoundCloud или Яндекс.Музыку")],
+            [_inline_article("Вставь ссылку или запрос", "Напиши: @bot ссылка на Instagram, TikTok, YouTube, VK, SoundCloud или Яндекс.Музыку — или @bot Исполнитель - Название для поиска музыки")],
             cache_time=1,
             is_personal=True,
         )
@@ -2528,6 +2528,8 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     upload_chat_id = INLINE_CACHE_CHAT_ID
     requester_id = inline_query.from_user.id if inline_query.from_user else None
     music_source = _extract_inline_music_source(text)
+    if not music_source and MUSIC_PATTERN.match(text):
+        music_source = text
     video_url = _extract_supported_video_url(text)
 
     try:
@@ -2581,7 +2583,7 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if not video_url:
             await inline_query.answer(
-                [_inline_article("Ссылка не найдена", "Укажи ссылку на Instagram, TikTok, YouTube, VK, SoundCloud или Яндекс.Музыку после имени бота.")],
+                [_inline_article("Ссылка не найдена", "Укажи ссылку на Instagram, TikTok, YouTube, VK, SoundCloud или Яндекс.Музыку — или Исполнитель - Название для поиска музыки.")],
                 cache_time=1,
                 is_personal=True,
             )
