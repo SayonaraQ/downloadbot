@@ -2095,11 +2095,14 @@ def _music_search_keyboard(session_id: str, candidates: list[dict[str, Any]]) ->
         keyboard.append([InlineKeyboardButton(
             label[:64],
             callback_data=f"mpick:{session_id}:{i}",
-            style="primary" if is_sc else "success",
-            icon_custom_emoji_id=_SC_ICON_EMOJI_ID if is_sc else _YT_ICON_EMOJI_ID,
         )])
     if AD_URL and AD_KEYBOARD_TEXT:
-        keyboard.append([InlineKeyboardButton(AD_KEYBOARD_TEXT, url=AD_URL)])
+        keyboard.append([InlineKeyboardButton(
+            AD_KEYBOARD_TEXT,
+            url=AD_URL,
+            style="primary",
+            icon_custom_emoji_id="5215667984860718631",
+        )])
     return InlineKeyboardMarkup(keyboard)
 
 
