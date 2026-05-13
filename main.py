@@ -159,6 +159,10 @@ AD_TRACK_TEXT = (os.getenv("AD_TRACK_TEXT") or "").strip() or None
 AD_TRACK_EMOJI_LEFT = (os.getenv("AD_TRACK_EMOJI_LEFT") or "").strip() or None
 AD_TRACK_EMOJI_RIGHT = (os.getenv("AD_TRACK_EMOJI_RIGHT") or "").strip() or None
 AD_TRACK_DELAY_SEC = max(1, int(os.getenv("AD_TRACK_DELAY_SEC", "10")))
+AD_VIDEO_TEXT = (os.getenv("AD_VIDEO_TEXT") or "").strip() or None
+AD_VIDEO_EMOJI_LEFT = (os.getenv("AD_VIDEO_EMOJI_LEFT") or "").strip() or None
+AD_VIDEO_EMOJI_RIGHT = (os.getenv("AD_VIDEO_EMOJI_RIGHT") or "").strip() or None
+AD_VIDEO_DELAY_SEC = max(1, int(os.getenv("AD_VIDEO_DELAY_SEC", "10")))
 
 # Audio extraction
 AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "bestaudio/best")
@@ -1287,7 +1291,7 @@ async def _send_media_group(
     items: list[dict[str, Any]],
     caption: str | None,
     parse_mode: str | None = None,
-) -> list[str]:
+) -> tuple[list[str], int | None]:
     """Send album (photos/videos). Returns list of Telegram file_ids.
 
     Telegram can sometimes reject sendMediaGroup with errors like:
@@ -1353,8 +1357,8 @@ async def _send_media_group(
                     media_group.append(InputMediaVideo(media=file_id, caption=_cap(i), parse_mode=_pm(i), supports_streaming=True))
 
             msgs = await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-            # file_ids are already known; still return them
-            return [it["tg_file_id"] for it in items]
+            first_msg_id = msgs[0].message_id if msgs else None
+            return [it["tg_file_id"] for it in items], first_msg_id
 
         # Send from local files (with filenames!)
         with ExitStack() as stack:
@@ -1391,12 +1395,13 @@ async def _send_media_group(
                 out_ids.append(msg.document.file_id)
             else:
                 out_ids.append("")
-        return out_ids
+        first_msg_id = msgs[0].message_id if msgs else None
+        return out_ids, first_msg_id
 
     except Exception as e:
         logger.warning("sendMediaGroup не удался (%s). Отправляю по одному.", str(e))
 
-    # Fallback: send one-by-one
+    # Fallback: send one-by-one (no message_id tracking)
     out: list[str] = []
     for i, it in enumerate(items):
         try:
@@ -1405,7 +1410,7 @@ async def _send_media_group(
             logger.warning("Не удалось отправить элемент %d/%d: %s", i + 1, len(items), str(e))
             out.append("")
 
-    return out
+    return out, None
 
 
 async def send_cache_entry(
@@ -1414,9 +1419,10 @@ async def send_cache_entry(
     entry: dict[str, Any],
     *,
     audio_caption: str | None = None,
+    video_caption: str | None = None,
 ) -> int | None:
     """Send cached media and update cached Telegram file_ids.
-    Returns message_id of the first audio sent with audio_caption (for later caption removal).
+    Returns message_id of the first item sent with a caption (for later caption removal).
     """
     key = str(entry["key"])
     d = _cache_dir_for_key(key)
@@ -1434,18 +1440,23 @@ async def send_cache_entry(
             "performer": it.get("performer"),
         })
 
-    first_audio_message_id: int | None = None
+    first_caption_message_id: int | None = None
     caption_used = False
 
     # Multiple photo/video → album
     album_candidates = [x for x in send_items if x["kind"] in {"photo", "video"}]
     if len(album_candidates) == len(send_items) and 1 < len(send_items) <= 10:
-        file_ids = await _send_media_group(update, context, items=send_items, caption=None)
+        vid_ad = _build_ad_video_caption() if video_caption else None
+        file_ids, first_msg_id = await _send_media_group(
+            update, context, items=send_items,
+            caption=vid_ad[0] if vid_ad else None,
+            parse_mode=vid_ad[1] if vid_ad else None,
+        )
         for i, fid in enumerate(file_ids):
             if fid:
                 items[i]["tg_file_id"] = fid
         _write_cache_entry(entry)
-        return None
+        return first_msg_id
 
     chat_id = update.effective_chat.id
 
@@ -1456,25 +1467,34 @@ async def send_cache_entry(
         audio_title = it.get("title") if kind == "audio" else None
         audio_performer = it.get("performer") if kind == "audio" else None
 
-        # First audio item gets the ad caption; others get no caption
-        use_caption = audio_caption if (kind == "audio" and audio_caption and not caption_used) else None
+        is_first_audio = kind == "audio" and audio_caption and not caption_used
+        is_first_video = kind in {"video", "photo"} and video_caption and not caption_used
 
-        if use_caption:
-            # Direct send to get full message object (need message_id for later edit)
+        if is_first_audio or is_first_video:
             caption_used = True
-            ad = _build_ad_caption()
-            ak: dict[str, Any] = {"caption": ad[0] if ad else use_caption, "parse_mode": ad[1] if ad else "Markdown"}
-            if audio_title:
-                ak["title"] = audio_title
-            if audio_performer:
-                ak["performer"] = audio_performer
-            if tg_file_id:
-                msg = await context.bot.send_audio(chat_id=chat_id, audio=tg_file_id, **ak)
+            ad = _build_ad_caption() if is_first_audio else _build_ad_video_caption()
+            ak: dict[str, Any] = {"caption": ad[0], "parse_mode": ad[1]}
+            if is_first_audio:
+                if audio_title:
+                    ak["title"] = audio_title
+                if audio_performer:
+                    ak["performer"] = audio_performer
+                if tg_file_id:
+                    msg = await context.bot.send_audio(chat_id=chat_id, audio=tg_file_id, **ak)
+                else:
+                    with open(abs_path, "rb") as f:
+                        msg = await context.bot.send_audio(chat_id=chat_id, audio=f, **ak)
+                items[i]["tg_file_id"] = msg.audio.file_id
             else:
-                with open(abs_path, "rb") as f:
-                    msg = await context.bot.send_audio(chat_id=chat_id, audio=f, **ak)
-            items[i]["tg_file_id"] = msg.audio.file_id
-            first_audio_message_id = msg.message_id
+                if tg_file_id:
+                    msg = await context.bot.send_video(chat_id=chat_id, video=tg_file_id, **ak)
+                else:
+                    with open(abs_path, "rb") as f:
+                        msg = await context.bot.send_video(chat_id=chat_id, video=f,
+                                                           supports_streaming=True, **ak)
+                items[i]["tg_file_id"] = msg.video.file_id if msg.video else (
+                    msg.document.file_id if msg.document else "")
+            first_caption_message_id = msg.message_id
         else:
             fid = await _send_single_item(
                 update, context,
@@ -1488,7 +1508,7 @@ async def send_cache_entry(
                 items[i]["tg_file_id"] = fid
 
     _write_cache_entry(entry)
-    return first_audio_message_id
+    return first_caption_message_id
 
 
 # -------------------------
@@ -2073,6 +2093,20 @@ async def _delete_message_after(bot: Any, chat_id: int, message_id: int, delay: 
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception:
         pass
+
+
+def _build_ad_video_caption() -> tuple[str, str] | None:
+    """Return (text, parse_mode) for video ad caption, or None if disabled."""
+    if not AD_VIDEO_TEXT:
+        return None
+    if AD_VIDEO_EMOJI_LEFT or AD_VIDEO_EMOJI_RIGHT:
+        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', AD_VIDEO_TEXT)
+        if AD_VIDEO_EMOJI_LEFT:
+            text = f'<tg-emoji emoji-id="{AD_VIDEO_EMOJI_LEFT}">⭐</tg-emoji> {text}'
+        if AD_VIDEO_EMOJI_RIGHT:
+            text = f'{text} <tg-emoji emoji-id="{AD_VIDEO_EMOJI_RIGHT}">⭐</tg-emoji>'
+        return text, "HTML"
+    return AD_VIDEO_TEXT, "Markdown"
 
 
 def _build_ad_caption() -> tuple[str, str] | None:
@@ -3200,7 +3234,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             url = text
             try:
                 entry = await _get_or_download_media_entry(url, requester_id=requester_id)
-                await send_cache_entry(update, context, entry)
+                vid_ad = _build_ad_video_caption()
+                msg_id = await send_cache_entry(
+                    update, context, entry,
+                    video_caption=AD_VIDEO_TEXT or None,
+                )
+                if msg_id and vid_ad:
+                    asyncio.create_task(_remove_caption_after(
+                        context.bot, update.message.chat_id, msg_id, AD_VIDEO_DELAY_SEC,
+                    ))
             except ValueError as e:
                 await update.message.reply_text(str(e))
             except Exception as e:
