@@ -171,7 +171,7 @@ AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "bestaudio/best")
 AUDIO_CODEC = os.getenv("AUDIO_CODEC", "mp3").strip() or "mp3"
 AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "192").strip() or "192"
 AUDIO_SEARCH_PREFIX = os.getenv("AUDIO_SEARCH_PREFIX", "ytsearch1").strip() or "ytsearch1"
-MUSIC_SEARCH_RESULTS = max(1, min(10, int(os.getenv("MUSIC_SEARCH_RESULTS", "5"))))
+MUSIC_SEARCH_RESULTS = max(1, min(10, int(os.getenv("MUSIC_SEARCH_RESULTS", "10"))))
 
 # Format selection (yt-dlp)
 DEFAULT_VIDEO_FORMAT = (
@@ -234,15 +234,16 @@ _music_search_sessions: dict[str, dict[str, Any]] = {}
 _MUSIC_MAX_PAGES = 3
 
 
-def _session_page(session: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+def _session_page(session: dict[str, Any]) -> tuple[list[dict[str, Any]], bool, bool]:
     all_c = session["all"]
     offset = session["offset"]
     size = session["page_size"]
     page = all_c[offset:offset + size]
     current_page = offset // size  # 0-indexed
+    has_prev = current_page > 0
     pool_has_more = offset + size < len(all_c)
     has_more = pool_has_more and (current_page < _MUSIC_MAX_PAGES - 1)
-    return page, has_more
+    return page, has_prev, has_more
 
 # -------------------------
 # URL patterns (keep strict behaviour: react only to supported domains)
@@ -2158,6 +2159,7 @@ async def _remove_caption_after(bot: Any, chat_id: int, message_id: int, delay: 
 def _music_search_keyboard(
     session_id: str,
     page: list[dict[str, Any]],
+    has_prev: bool = False,
     has_more: bool = False,
 ) -> InlineKeyboardMarkup:
     """Build styled inline keyboard for music search results."""
@@ -2175,11 +2177,13 @@ def _music_search_keyboard(
             callback_data=f"mpick:{session_id}:{i}",
             icon_custom_emoji_id=_SC_ICON_EMOJI_ID if is_sc else _YT_ICON_EMOJI_ID,
         )])
+    nav = []
+    if has_prev:
+        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"mback:{session_id}"))
     if has_more:
-        keyboard.append([InlineKeyboardButton(
-            "➡️ Ещё результаты",
-            callback_data=f"mmore:{session_id}",
-        )])
+        nav.append(InlineKeyboardButton("➡️ Ещё", callback_data=f"mmore:{session_id}"))
+    if nav:
+        keyboard.append(nav)
     if AD_URL and AD_KEYBOARD_TEXT:
         keyboard.append([InlineKeyboardButton(
             AD_KEYBOARD_TEXT,
@@ -2259,7 +2263,7 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await cq.edit_message_text("Результаты поиска устарели. Повтори /music запрос.")
         return
 
-    page, _ = _session_page(session)
+    page, _, _ = _session_page(session)
     try:
         candidate = page[int(idx_str)]
     except (ValueError, IndexError):
@@ -2370,11 +2374,11 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     session_id = uuid.uuid4().hex[:12]
     _music_search_sessions[session_id] = {"all": candidates, "offset": 0, "page_size": MUSIC_SEARCH_RESULTS}
-    page, has_more = _session_page(_music_search_sessions[session_id])
+    page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
 
     await status_msg.edit_text(
         f"Результаты по «{source}»:",
-        reply_markup=_music_search_keyboard(session_id, page, has_more),
+        reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
     )
 
 
@@ -2401,16 +2405,42 @@ async def music_more_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     session["offset"] = new_offset
-    page, pool_has_more = _session_page(session)
+    page, has_prev, has_more = _session_page(session)
     if not page:
         await cq.answer("Больше результатов нет.", show_alert=False)
         session["offset"] -= session["page_size"]
         return
 
-    has_more = pool_has_more and (current_page < _MUSIC_MAX_PAGES - 1)
+    await cq.edit_message_reply_markup(
+        reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
+    )
+
+
+async def music_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    if cq is None:
+        return
+    await cq.answer()
+
+    parts = (cq.data or "").split(":")
+    if len(parts) != 2 or parts[0] != "mback":
+        return
+
+    _, session_id = parts
+    session = _music_search_sessions.get(session_id)
+    if not session:
+        await cq.edit_message_text("Результаты поиска устарели. Повтори /music запрос.")
+        return
+
+    if session["offset"] == 0:
+        await cq.answer("Это первая страница.", show_alert=False)
+        return
+
+    session["offset"] -= session["page_size"]
+    page, has_prev, has_more = _session_page(session)
 
     await cq.edit_message_reply_markup(
-        reply_markup=_music_search_keyboard(session_id, page, has_more),
+        reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
     )
 
 
@@ -3259,10 +3289,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         return
                     session_id = uuid.uuid4().hex[:12]
                     _music_search_sessions[session_id] = {"all": candidates, "offset": 0, "page_size": MUSIC_SEARCH_RESULTS}
-                    page, has_more = _session_page(_music_search_sessions[session_id])
+                    page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
                     await update.message.reply_text(
                         f"Результаты по «{source}»:",
-                        reply_markup=_music_search_keyboard(session_id, page, has_more),
+                        reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
                     )
                 except Exception as e:
                     logger.error("Ошибка поиска через ForceReply: %s", e)
@@ -3369,6 +3399,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("ytmusic", ytmusic_command))
     app.add_handler(CallbackQueryHandler(music_pick_callback, pattern=r"^mpick:"))
     app.add_handler(CallbackQueryHandler(music_more_callback, pattern=r"^mmore:"))
+    app.add_handler(CallbackQueryHandler(music_back_callback, pattern=r"^mback:"))
     app.add_handler(TypeHandler(Update, handle_guest_update), group=-1)
     app.add_handler(InlineQueryHandler(handle_inline_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_cookie_document))
