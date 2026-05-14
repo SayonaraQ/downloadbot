@@ -2613,7 +2613,7 @@ async def sc_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if len(parts) != 2 or parts[0] != "schart":
         return
     kind = parts[1]
-    if kind not in _SC_PRESET_QUERIES:
+    if kind not in ("top", "new"):
         return
 
     label = "🔥 Топ хиты" if kind == "top" else "✨ Новинки"
