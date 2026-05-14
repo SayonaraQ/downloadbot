@@ -1744,8 +1744,8 @@ def _download_audio_with_cookie(
     cookiefile: str | None,
     site: str,
     source_url: str | None,
+    proxy: str | None = None,
 ) -> dict[str, Any]:
-    proxy = _proxy_for_audio_site(site)
     target = source_url or f"{AUDIO_SEARCH_PREFIX}:{source}"
 
     if site == "yandex_music" and source_url:
@@ -1914,17 +1914,22 @@ def download_audio_with_fallback(source: str, tmp_dir: Path) -> dict[str, Any]:
             logger.warning("[music:yandex_music] API failed, falling back to yt-dlp: %s", e)
 
     cookie_files = _cookie_files_for_audio_site(site)
-    attempts: list[str | None] = []
+    site_proxy = _proxy_for_audio_site(site)
+    # Build (cookiefile, proxy) pairs: first attempt without proxy, then with proxy as fallback
+    cookie_attempts: list[str | None] = []
     if TRY_NO_COOKIES_FIRST:
-        attempts.append(None)
-    attempts.extend(cookie_files)
-    if not attempts:
-        attempts.append(None)
+        cookie_attempts.append(None)
+    cookie_attempts.extend(cookie_files)
+    if not cookie_attempts:
+        cookie_attempts.append(None)
+    attempts: list[tuple[str | None, str | None]] = [(c, None) for c in cookie_attempts]
+    if site_proxy:
+        attempts += [(c, site_proxy) for c in cookie_attempts]
 
     last_err: Exception | None = None
     last_err_text: str | None = None
 
-    for idx, cookiefile in enumerate(attempts, start=1):
+    for idx, (cookiefile, proxy) in enumerate(attempts, start=1):
         _cleanup_tmp_dir(tmp_dir)
         try:
             logger.info(
@@ -1933,7 +1938,7 @@ def download_audio_with_fallback(source: str, tmp_dir: Path) -> dict[str, Any]:
                 idx,
                 len(attempts),
                 "нет" if not cookiefile else cookiefile,
-                "да" if _proxy_for_audio_site(site) else "нет",
+                "да" if proxy else "нет",
             )
             return _download_audio_with_cookie(
                 source,
@@ -1941,6 +1946,7 @@ def download_audio_with_fallback(source: str, tmp_dir: Path) -> dict[str, Any]:
                 cookiefile=cookiefile,
                 site=site,
                 source_url=source_url,
+                proxy=proxy,
             )
         except DownloadError as e:
             last_err = e
