@@ -1179,17 +1179,32 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
 
 
 def _download_ig_photos_direct(url: str, workdir: Path, cookiefile: str | None) -> dict[str, Any]:
-    """Download Instagram photo post by reading image URLs from yt-dlp info dict
-    and fetching them directly with requests — bypasses format selection entirely.
-    """
-    opts: dict[str, Any] = {"quiet": True, "no_warnings": True}
-    if cookiefile:
-        opts["cookiefile"] = cookiefile
-    opts["noplaylist"] = False
-    opts["playlistend"] = max(1, min(MAX_ITEMS_PER_LINK, 50))
+    """Download Instagram photo post by extracting CDN image URLs and fetching directly.
 
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    Uses yt-dlp subprocess with --dump-single-json to get raw metadata without
+    triggering Python API format validation (which raises "No video formats found!").
+    """
+    cmd = [
+        os.sys.executable, "-m", "yt_dlp",
+        "--dump-single-json", "--no-warnings", "--quiet",
+        "--no-playlist",
+    ]
+    if cookiefile:
+        cmd.extend(["--cookies", cookiefile])
+    cmd.append(url)
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise ValueError("yt-dlp превысил лимит времени при извлечении метаданных.")
+
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        err = (proc.stderr or "")[:300]
+        raise ValueError(f"yt-dlp не вернул метаданные. stderr: {err}")
+
+    import json as _json
+    info = _json.loads(raw)
 
     if not info:
         raise ValueError("yt-dlp не вернул метаданные поста.")
