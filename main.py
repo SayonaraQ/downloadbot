@@ -140,6 +140,7 @@ INLINE_PREPARE_WAIT_SECONDS = max(
 # Downloader limits
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "5"))
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "600"))
+MIN_DURATION_SEC = int(os.getenv("MIN_DURATION_SEC", "60"))
 # Backward-compatible: older env used MAX_UPLOAD_MB
 MAX_SIZE_MB = int((os.getenv("MAX_SIZE_MB") or os.getenv("MAX_UPLOAD_MB") or "48").strip())
 MAX_ITEMS_PER_LINK = int(os.getenv("MAX_ITEMS_PER_LINK", "10"))
@@ -2185,6 +2186,8 @@ def _search_music_candidates(query: str, n: int, prefix: str = "ytsearch") -> li
             continue
         dur = e.get("duration")
         if dur and dur > MAX_DURATION_SEC:
+            continue
+        if dur and dur < MIN_DURATION_SEC:
             continue
         vid_id = e.get("id") or ""
         url = e.get("webpage_url") or e.get("url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None)
