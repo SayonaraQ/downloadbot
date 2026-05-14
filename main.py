@@ -231,7 +231,7 @@ _inline_prepare_tasks: dict[str, asyncio.Task] = {}
 
 # Pending /music search sessions: session_id -> {all, offset, page_size}
 _music_search_sessions: dict[str, dict[str, Any]] = {}
-_MUSIC_MAX_PAGES = 3
+_MUSIC_MAX_PAGES = max(1, int(os.getenv("MUSIC_MAX_PAGES", "3")))
 
 
 def _session_page(session: dict[str, Any]) -> tuple[list[dict[str, Any]], bool, bool]:
