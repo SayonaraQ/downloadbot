@@ -2496,14 +2496,33 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             task.cancel()
 
     await cq.edit_message_text(f"Скачиваю: {title}…")
+    channel = candidate.get("channel", "")
 
     async with sema:
         try:
             entry = await _get_or_download_audio_entry(url, requester_id=requester_id)
         except Exception as e:
-            logger.error("Ошибка при загрузке трека по выбору: %s", e)
-            await cq.edit_message_text(f"Не удалось загрузить «{title}».")
-            return
+            err_lower = str(e).lower()
+            is_404 = "404" in err_lower or "not found" in err_lower
+            if is_404 and candidate.get("source") == "sc":
+                # SoundCloud track unavailable — retry via YouTube search by title
+                search_query = f"{channel} - {title}" if channel else title
+                logger.warning(
+                    "SC track 404, retrying via YouTube search: %s", search_query
+                )
+                await cq.edit_message_text(f"Трек недоступен на SoundCloud, ищу на YouTube…")
+                try:
+                    entry = await _get_or_download_audio_entry(
+                        search_query, requester_id=requester_id
+                    )
+                except Exception as e2:
+                    logger.error("YouTube fallback тоже провалился: %s", e2)
+                    await cq.edit_message_text(f"Не удалось загрузить «{title}».")
+                    return
+            else:
+                logger.error("Ошибка при загрузке трека по выбору: %s", e)
+                await cq.edit_message_text(f"Не удалось загрузить «{title}».")
+                return
 
     key = str(entry["key"])
     d = _cache_dir_for_key(key)
