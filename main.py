@@ -2061,7 +2061,7 @@ async def _get_or_download_audio_entry(
 
 _SC_PRESET_QUERIES: dict[str, str] = {
     "top": "top hits",
-    "new": "new music 2025",
+    "new": "new music 2026",
 }
 
 
