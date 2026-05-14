@@ -3375,8 +3375,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 BOT_COMMANDS = [
-    BotCommand("music",   "Поиск музыки: список вариантов YouTube + SoundCloud"),
-    BotCommand("ytmusic", "Скачать музыку напрямую: ссылка или запрос → top-1"),
+    BotCommand("music",   "Поиск музыки"),
+    BotCommand("ytmusic", "Скачать звук из видео"),
     BotCommand("start",   "Описание бота"),
 ]
 
