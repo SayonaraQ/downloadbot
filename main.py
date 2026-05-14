@@ -2059,15 +2059,16 @@ async def _get_or_download_audio_entry(
 # Telegram handlers
 # -------------------------
 
-# SoundCloud global charts URLs (yt-dlp parses them as playlists)
+# SoundCloud global charts URLs — genre=soundcloud:genres:pop фильтрует в сторону
+# западного попа и убирает арабскую/индийскую музыку с глобальных чартов
 _SC_CHART_URLS: dict[str, str] = {
-    "top": "https://soundcloud.com/charts/top?genre=all-music&country=all-countries",
-    "new": "https://soundcloud.com/charts/new?genre=all-music&country=all-countries",
+    "top": "https://soundcloud.com/charts/top?genre=soundcloud:genres:pop",
+    "new": "https://soundcloud.com/charts/new?genre=soundcloud:genres:pop",
 }
 # Fallback search queries if chart URL fails
 _SC_PRESET_QUERIES: dict[str, str] = {
-    "top": "top global pop hits 2025",
-    "new": "new pop music releases 2025",
+    "top": "top pop hits 2025 official",
+    "new": "new pop music 2025 official",
 }
 
 
@@ -2090,8 +2091,10 @@ def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
     for e in entries:
         if not isinstance(e, dict):
             continue
+        # Chart pages often omit duration in flat extraction — skip only if
+        # duration is explicitly present and out of range (not when it's absent)
         dur = e.get("duration")
-        if not dur or dur > MAX_DURATION_SEC or dur < MIN_DURATION_SEC:
+        if dur and (dur > MAX_DURATION_SEC or dur < MIN_DURATION_SEC):
             continue
         track_url = e.get("webpage_url") or e.get("url")
         if not track_url:
@@ -2100,7 +2103,7 @@ def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
             "url": track_url,
             "title": e.get("title") or "Без названия",
             "channel": e.get("channel") or e.get("uploader") or "",
-            "duration": dur,
+            "duration": dur or 0,
             "source": "sc",
         })
     return results
