@@ -2059,65 +2059,22 @@ async def _get_or_download_audio_entry(
 # Telegram handlers
 # -------------------------
 
-def _fetch_sc_chart(kind: str = "top") -> list[dict[str, Any]]:
-    """Fetch SoundCloud charts (top or new). kind: 'top' or 'new'."""
-    n = MUSIC_SEARCH_RESULTS * _MUSIC_MAX_PAGES
-    url = f"https://soundcloud.com/charts/{kind}"
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "skip_download": True,
-        "playlistend": n,
-    }
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    entries = (info or {}).get("entries") or []
-    results = []
-    for e in entries:
-        if not isinstance(e, dict):
-            continue
-        dur = e.get("duration")
-        if dur and dur > MAX_DURATION_SEC:
-            continue
-        if dur and dur < MIN_DURATION_SEC:
-            continue
-        entry_url = e.get("webpage_url") or e.get("url")
-        if not entry_url:
-            continue
-        results.append({
-            "url": entry_url,
-            "title": e.get("title") or "Без названия",
-            "channel": e.get("channel") or e.get("uploader") or "",
-            "duration": dur,
-            "source": "sc",
-        })
-    return results
-
-
-async def _show_sc_chart(kind: str, label: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await update.message.reply_text(f"Загружаю {label}…")
-    try:
-        candidates = await asyncio.to_thread(_fetch_sc_chart, kind)
-    except Exception as e:
-        logger.warning("SC chart '%s' failed: %s", kind, e)
-        candidates = []
-    if not candidates:
-        await msg.edit_text("Не удалось загрузить чарты. Попробуй /music запрос.")
-        return
-    session_id = _create_music_session(candidates, context.bot, msg.chat_id, msg.message_id)
-    page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
-    other_kind = "new" if kind == "top" else "top"
-    other_label = "✨ Новинки" if kind == "top" else "🔥 Топ"
-    keyboard = _music_search_keyboard(session_id, page, has_prev, has_more)
-    # Prepend chart-switch button
-    switch_row = [InlineKeyboardButton(other_label, callback_data=f"schart:{other_kind}")]
-    keyboard = InlineKeyboardMarkup([switch_row] + keyboard.inline_keyboard)
-    await msg.edit_text(f"{label} SoundCloud:", reply_markup=keyboard)
+_SC_PRESET_QUERIES: dict[str, str] = {
+    "top": "top hits",
+    "new": "new music 2025",
+}
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _show_sc_chart("top", "🔥 Топ", update, context)
+    await update.message.reply_text(
+        "Привет! Отправь ссылку на Instagram, TikTok, YouTube или VK — скачаю медиа.\n"
+        "Напиши название трека — найду и скачаю музыку.\n"
+        "Или выбери подборку:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔥 Топ хиты", callback_data="schart:top"),
+            InlineKeyboardButton("✨ Новинки", callback_data="schart:new"),
+        ]]),
+    )
 
 
 async def get_users_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2295,25 +2252,28 @@ async def _search_music_multi_async(query: str, page_size: int) -> list[dict[str
         if i < len(sc):
             combined.append({**sc[i], "source": "sc"})
 
-    # Fallback: if too few results and query looks like "Artist - Title", retry without dash
+    # Fallback: if few results and query looks like "Part1 - Part2", search each part separately
     if len(combined) < page_size and "-" in query:
-        alt_query = re.sub(r"\s*-\s*", " ", query).strip()
-        yt2_task = asyncio.to_thread(_search_music_candidates, alt_query, pool_per_source, "ytsearch")
-        sc2_task = asyncio.to_thread(_search_music_candidates, alt_query, pool_per_source, "scsearch")
-        yt2_res, sc2_res = await asyncio.gather(yt2_task, sc2_task, return_exceptions=True)
-        yt2 = yt2_res if isinstance(yt2_res, list) else []
-        sc2 = sc2_res if isinstance(sc2_res, list) else []
+        parts_split = [p.strip() for p in query.split("-", 1) if p.strip()]
         seen_urls = {c["url"] for c in combined}
-        extra: list[dict[str, Any]] = []
-        for i in range(max(len(yt2), len(sc2))):
-            if i < len(yt2):
-                extra.append({**yt2[i], "source": "yt"})
-            if i < len(sc2):
-                extra.append({**sc2[i], "source": "sc"})
-        for c in extra:
-            if c["url"] not in seen_urls:
-                combined.append(c)
-                seen_urls.add(c["url"])
+        for part in parts_split:
+            if not part or part == query:
+                continue
+            fb_yt = asyncio.to_thread(_search_music_candidates, part, pool_per_source, "ytsearch")
+            fb_sc = asyncio.to_thread(_search_music_candidates, part, pool_per_source, "scsearch")
+            yt2_res, sc2_res = await asyncio.gather(fb_yt, fb_sc, return_exceptions=True)
+            yt2 = yt2_res if isinstance(yt2_res, list) else []
+            sc2 = sc2_res if isinstance(sc2_res, list) else []
+            extra: list[dict[str, Any]] = []
+            for i in range(max(len(yt2), len(sc2))):
+                if i < len(yt2):
+                    extra.append({**yt2[i], "source": "yt"})
+                if i < len(sc2):
+                    extra.append({**sc2[i], "source": "sc"})
+            for c in extra:
+                if c["url"] not in seen_urls:
+                    combined.append(c)
+                    seen_urls.add(c["url"])
 
     return combined
 
@@ -2543,30 +2503,26 @@ async def sc_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if len(parts) != 2 or parts[0] != "schart":
         return
     kind = parts[1]
-    if kind not in ("top", "new"):
+    if kind not in _SC_PRESET_QUERIES:
         return
 
-    label = "🔥 Топ" if kind == "top" else "✨ Новинки"
-    await cq.edit_message_text(f"Загружаю {label}…")
+    label = "🔥 Топ хиты" if kind == "top" else "✨ Новинки"
+    query = _SC_PRESET_QUERIES[kind]
+    await cq.edit_message_text(f"Ищу {label}…")
     try:
-        candidates = await asyncio.to_thread(_fetch_sc_chart, kind)
+        candidates = await _search_music_multi_async(query, MUSIC_SEARCH_RESULTS)
     except Exception as e:
-        logger.warning("SC chart '%s' failed: %s", kind, e)
+        logger.warning("Preset search '%s' failed: %s", query, e)
         candidates = []
     if not candidates:
-        await cq.edit_message_text("Не удалось загрузить чарты.")
+        await cq.edit_message_text("Ничего не найдено.")
         return
 
     chat_id = cq.message.chat_id
     message_id = cq.message.message_id
     session_id = _create_music_session(candidates, context.bot, chat_id, message_id)
     page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
-    other_kind = "new" if kind == "top" else "top"
-    other_label = "✨ Новинки" if kind == "top" else "🔥 Топ"
-    switch_row = [InlineKeyboardButton(other_label, callback_data=f"schart:{other_kind}")]
-    keyboard = _music_search_keyboard(session_id, page, has_prev, has_more)
-    keyboard = InlineKeyboardMarkup([switch_row] + keyboard.inline_keyboard)
-    await cq.edit_message_text(f"{label} SoundCloud:", reply_markup=keyboard)
+    await cq.edit_message_text(f"{label}:", reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more))
 
 
 def _extract_ytmusic_command_payload(text: str) -> str:
