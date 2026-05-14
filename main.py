@@ -3404,7 +3404,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         pass
 
     # 4) In private chats: any non-URL text → music search (outside sema — no download)
-    if update.message.chat.type == "private" and not _looks_like_url(text) and not MUSIC_PATTERN.match(text) and not _extract_inline_music_source(text):
+    if update.message.chat.type == "private" and not _looks_like_url(text) and not _extract_inline_music_source(text):
         status_msg = await update.message.reply_text("Ищу…")
         try:
             candidates = await _search_music_multi_async(text, MUSIC_SEARCH_RESULTS)
@@ -3458,18 +3458,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(
                     "Не удалось загрузить. Возможно пора обновить cookies"
                 )
-            return
-
-        # 3) Music by query pattern
-        if MUSIC_PATTERN.match(text):
-            try:
-                entry = await _get_or_download_audio_entry(text, requester_id=requester_id)
-                await send_cache_entry(update, context, entry)
-            except ValueError as e:
-                await update.message.reply_text(str(e))
-            except Exception as e:
-                logger.error("Ошибка при загрузке музыки: %s", e)
-                await update.message.reply_text("Не удалось загрузить музыку.")
             return
 
         # Otherwise ignore
