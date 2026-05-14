@@ -1190,6 +1190,7 @@ def download_media_with_fallback(
 
     last_err: Exception | None = None
     last_err_text: str | None = None
+    no_video_err: Exception | None = None  # Instagram photo-only post error
 
     for idx, cookiefile in enumerate(attempts, start=1):
         # Ensure temp directory is clean between attempts
@@ -1212,10 +1213,50 @@ def download_media_with_fallback(
             last_err = e
             last_err_text = str(e)
             logger.warning(f"[{site}] yt-dlp DownloadError: {e}")
+            err_lower = str(e).lower()
+            if "no video" in err_lower or "there is no video" in err_lower:
+                no_video_err = e
         except Exception as e:
             last_err = e
             last_err_text = str(e)
             logger.warning(f"[{site}] Ошибка скачивания: {e}")
+
+    # Instagram photo-only post: all video-format attempts failed with "no video".
+    # Retry with format=None (yt-dlp picks best available, including jpeg photos).
+    if no_video_err and site == "instagram":
+        logger.info("[instagram] Все попытки видео провалились с 'no video', пробую как фото (format=best).")
+        last_cookiefile = attempts[-1] if attempts else None
+        try:
+            for p in tmp_dir.glob("*"):
+                if p.is_file() or p.is_symlink():
+                    p.unlink(missing_ok=True)
+                elif p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            outtmpl = str(tmp_dir / "%(id)s_%(playlist_index)s.%(ext)s")
+            opts = _ytdlp_common_opts(outtmpl=outtmpl, cookiefile=last_cookiefile)
+            opts["noplaylist"] = False
+            opts["playlistend"] = max(1, min(MAX_ITEMS_PER_LINK, 50))
+            opts["format"] = "best"
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                wanted_story_id = _extract_ig_story_id(url)
+                if wanted_story_id:
+                    info = _filter_entries_by_id(info, wanted_story_id)
+                ydl.process_ie_result(info, download=True)
+            all_files = _collect_downloaded_files(tmp_dir)
+            selected_files, _ = _select_primary_downloads(all_files)
+            if selected_files:
+                selected_files = _normalize_downloaded_files(selected_files)
+                title = info.get("title") if isinstance(info, dict) else None
+                logger.info("[instagram] Скачано как фото: %s", [p.name for p in selected_files])
+                return {"title": title, "files": [str(p) for p in selected_files]}
+        except Exception as e:
+            logger.warning("[instagram] Фото-фолбэк тоже провалился: %s", e)
+            last_err = e
+            last_err_text = str(e)
 
     raise RuntimeError(last_err_text or "Не удалось скачать медиа.") from last_err
 
