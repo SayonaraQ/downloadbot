@@ -1178,118 +1178,6 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
     }
 
 
-def _download_ig_photos_direct(url: str, workdir: Path, cookiefile: str | None) -> dict[str, Any]:
-    """Download Instagram photo post by extracting CDN image URLs and fetching directly.
-
-    Uses yt-dlp subprocess with --dump-single-json to get raw metadata without
-    triggering Python API format validation (which raises "No video formats found!").
-    """
-    cmd = [
-        os.sys.executable, "-m", "yt_dlp",
-        "--dump-single-json", "--no-warnings", "--quiet",
-        "--no-playlist",
-    ]
-    if cookiefile:
-        cmd.extend(["--cookies", cookiefile])
-    cmd.append(url)
-
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    except subprocess.TimeoutExpired:
-        raise ValueError("yt-dlp превысил лимит времени при извлечении метаданных.")
-
-    raw = (proc.stdout or "").strip()
-    if not raw:
-        err = (proc.stderr or "")[:300]
-        raise ValueError(f"yt-dlp не вернул метаданные. stderr: {err}")
-
-    import json as _json
-    info = _json.loads(raw)
-
-    if not info:
-        raise ValueError("yt-dlp не вернул метаданные поста.")
-
-    # Flatten to list of entries
-    entries: list[dict] = []
-    if isinstance(info, dict):
-        if info.get("entries"):
-            entries = [e for e in info["entries"] if isinstance(e, dict)]
-        else:
-            entries = [info]
-
-    wanted_story_id = _extract_ig_story_id(url)
-    if wanted_story_id and len(entries) > 1:
-        filtered = [e for e in entries if str(e.get("id", "")) == wanted_story_id]
-        if filtered:
-            entries = filtered
-
-    _IMAGE_EXTS = {"jpg", "jpeg", "png", "webp"}
-
-    def _best_image_url(entry: dict) -> tuple[str, str] | None:
-        """Return (url, ext) for the best image in this entry."""
-        # 1) Direct url field with image ext
-        direct = entry.get("url", "")
-        ext = (entry.get("ext") or "").lower()
-        if direct and ext in _IMAGE_EXTS:
-            return direct, ext
-        # 2) Scan formats list
-        for fmt in (entry.get("formats") or []):
-            if not isinstance(fmt, dict):
-                continue
-            fe = (fmt.get("ext") or "").lower()
-            fu = fmt.get("url", "")
-            if fe in _IMAGE_EXTS and fu:
-                return fu, fe
-        # 3) Best thumbnail as last resort
-        thumbs = [t for t in (entry.get("thumbnails") or []) if isinstance(t, dict) and t.get("url")]
-        if thumbs:
-            best = max(thumbs, key=lambda t: (t.get("preference", 0), t.get("width", 0) or 0))
-            thumb_url = best.get("url", "")
-            if thumb_url:
-                return thumb_url, "jpg"
-        return None
-
-    image_urls: list[tuple[str, str]] = []
-    for entry in entries[:MAX_ITEMS_PER_LINK]:
-        result = _best_image_url(entry)
-        if result:
-            image_urls.append(result)
-
-    if not image_urls:
-        raise ValueError("Не нашли изображений в метаданных поста Instagram.")
-
-    session = requests.Session()
-    hdrs = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"}
-    if cookiefile:
-        try:
-            cj = cookiejar.MozillaCookieJar()
-            cj.load(cookiefile, ignore_expires=True, ignore_discard=True)
-            session.cookies = cj
-        except Exception:
-            pass
-
-    downloaded: list[str] = []
-    for i, (img_url, ext) in enumerate(image_urls):
-        filepath = workdir / f"photo_{i + 1:03d}.{ext}"
-        try:
-            resp = session.get(img_url, headers=hdrs, timeout=30, stream=True)
-            resp.raise_for_status()
-            with open(filepath, "wb") as f:
-                for chunk in resp.iter_content(8192):
-                    if chunk:
-                        f.write(chunk)
-            downloaded.append(str(filepath))
-            logger.info("[instagram] Фото %d/%d скачано: %s", i + 1, len(image_urls), filepath.name)
-        except Exception as e:
-            logger.warning("[instagram] Не удалось скачать фото %d: %s", i + 1, e)
-
-    if not downloaded:
-        raise ValueError("Не удалось скачать ни одного фото из поста.")
-
-    title = info.get("title") if isinstance(info, dict) else None
-    return {"title": title, "files": downloaded}
-
-
 def download_media_with_fallback(
     url: str,
     tmp_dir: Path,
@@ -1302,7 +1190,6 @@ def download_media_with_fallback(
 
     last_err: Exception | None = None
     last_err_text: str | None = None
-    no_video_err: Exception | None = None  # Instagram photo-only post error
 
     for idx, cookiefile in enumerate(attempts, start=1):
         # Ensure temp directory is clean between attempts
@@ -1326,32 +1213,14 @@ def download_media_with_fallback(
             last_err_text = str(e)
             logger.warning(f"[{site}] yt-dlp DownloadError: {e}")
             err_lower = str(e).lower()
-            if "no video" in err_lower or "there is no video" in err_lower:
-                no_video_err = e
+            if site == "instagram" and ("no video" in err_lower or "there is no video" in err_lower):
+                raise UserFacingDownloadError(
+                    "Фото-посты Instagram не поддерживаются — только Reels и Stories."
+                ) from e
         except Exception as e:
             last_err = e
             last_err_text = str(e)
             logger.warning(f"[{site}] Ошибка скачивания: {e}")
-
-    # Instagram photo-only post: all video-format attempts failed with "no video".
-    # Bypass yt-dlp format selection and download images directly from CDN URLs.
-    if no_video_err and site == "instagram":
-        logger.info("[instagram] Пробую фото-фолбэк: скачиваю изображения напрямую через CDN.")
-        last_cookiefile = attempts[-1] if attempts else None
-        try:
-            for p in tmp_dir.glob("*"):
-                if p.is_file() or p.is_symlink():
-                    p.unlink(missing_ok=True)
-                elif p.is_dir():
-                    shutil.rmtree(p, ignore_errors=True)
-        except Exception:
-            pass
-        try:
-            return _download_ig_photos_direct(url, tmp_dir, last_cookiefile)
-        except Exception as e:
-            logger.warning("[instagram] Фото-фолбэк провалился: %s", e)
-            last_err = e
-            last_err_text = str(e)
 
     raise RuntimeError(last_err_text or "Не удалось скачать медиа.") from last_err
 
