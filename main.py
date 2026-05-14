@@ -2169,12 +2169,16 @@ def _search_music_candidates(query: str, n: int, prefix: str = "ytsearch") -> li
         "extract_flat": True,
         "skip_download": True,
     }
+    fetch_n = n * 2
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"{prefix}{n}:{query}", download=False)
+        info = ydl.extract_info(f"{prefix}{fetch_n}:{query}", download=False)
     entries = (info or {}).get("entries") or []
     results = []
     for e in entries:
         if not isinstance(e, dict):
+            continue
+        dur = e.get("duration")
+        if dur and dur > MAX_DURATION_SEC:
             continue
         vid_id = e.get("id") or ""
         url = e.get("webpage_url") or e.get("url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None)
@@ -2184,8 +2188,10 @@ def _search_music_candidates(query: str, n: int, prefix: str = "ytsearch") -> li
             "url": url,
             "title": e.get("title") or "Без названия",
             "channel": e.get("channel") or e.get("uploader") or "",
-            "duration": e.get("duration"),
+            "duration": dur,
         })
+        if len(results) >= n:
+            break
     return results
 
 
