@@ -2059,10 +2059,51 @@ async def _get_or_download_audio_entry(
 # Telegram handlers
 # -------------------------
 
-_SC_PRESET_QUERIES: dict[str, str] = {
-    "top": "top hits",
-    "new": "new music 2026",
+# SoundCloud global charts URLs (yt-dlp parses them as playlists)
+_SC_CHART_URLS: dict[str, str] = {
+    "top": "https://soundcloud.com/charts/top?genre=all-music&country=all-countries",
+    "new": "https://soundcloud.com/charts/new?genre=all-music&country=all-countries",
 }
+# Fallback search queries if chart URL fails
+_SC_PRESET_QUERIES: dict[str, str] = {
+    "top": "top global pop hits 2025",
+    "new": "new pop music releases 2025",
+}
+
+
+def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
+    """Fetch tracks from a SoundCloud chart page URL via yt-dlp."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+        "playlistend": n,
+    }
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception:
+        return []
+    entries = (info or {}).get("entries") or []
+    results = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        dur = e.get("duration")
+        if not dur or dur > MAX_DURATION_SEC or dur < MIN_DURATION_SEC:
+            continue
+        track_url = e.get("webpage_url") or e.get("url")
+        if not track_url:
+            continue
+        results.append({
+            "url": track_url,
+            "title": e.get("title") or "Без названия",
+            "channel": e.get("channel") or e.get("uploader") or "",
+            "duration": dur,
+            "source": "sc",
+        })
+    return results
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2506,16 +2547,25 @@ async def sc_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     label = "🔥 Топ хиты" if kind == "top" else "✨ Новинки"
-    query = _SC_PRESET_QUERIES[kind]
     pool = MUSIC_SEARCH_RESULTS * _MUSIC_MAX_PAGES
     await cq.edit_message_text(f"Ищу {label}…")
-    try:
-        # SoundCloud only — YouTube returns compilations for these queries
-        candidates = await asyncio.to_thread(_search_music_candidates, query, pool, "scsearch")
-        candidates = [{**c, "source": "sc"} for c in candidates]
-    except Exception as e:
-        logger.warning("Preset search '%s' failed: %s", query, e)
-        candidates = []
+
+    # Try official SoundCloud global charts first; fall back to search query
+    chart_url = _SC_CHART_URLS.get(kind, "")
+    candidates: list[dict[str, Any]] = []
+    if chart_url:
+        candidates = await asyncio.to_thread(_fetch_sc_chart_url, chart_url, pool)
+        if candidates:
+            logger.info("Chart '%s': got %d tracks from chart URL", kind, len(candidates))
+    if not candidates:
+        query = _SC_PRESET_QUERIES[kind]
+        logger.info("Chart '%s': chart URL empty, falling back to search '%s'", kind, query)
+        try:
+            candidates = await asyncio.to_thread(_search_music_candidates, query, pool, "scsearch")
+            candidates = [{**c, "source": "sc"} for c in candidates]
+        except Exception as e:
+            logger.warning("Preset search '%s' failed: %s", query, e)
+            candidates = []
     if not candidates:
         await cq.edit_message_text("Ничего не найдено.")
         return
@@ -3357,6 +3407,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if update.message is None or update.message.text is None:
         return
 
+    # Admin broadcast flow intercept
+    if (
+        update.message.from_user is not None
+        and _bcast_is_admin(update.message.from_user.id)
+        and context.user_data.get(_BCAST_STATE) in _BCAST_INPUT_STATES
+    ):
+        await broadcast_text_input(update, context)
+        return
+
     # Reply to /music ForceReply prompt → treat as music search
     if _is_music_forcereply(update.message):
         source = update.message.text.strip()
@@ -3464,6 +3523,376 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
 
+# -------------------------
+# Broadcast (admin only)
+# -------------------------
+
+_BCAST_STATE = "_bcast_state"
+_BCAST_FILTER = "_bcast_filter"
+_BCAST_EXCLUDE = "_bcast_exclude_ids"
+_BCAST_ONLY = "_bcast_only_ids"
+_BCAST_TEXT = "_bcast_text"
+
+_BCAST_S_FILTER = "filter_select"
+_BCAST_S_AWAIT_EXCL = "awaiting_exclude"
+_BCAST_S_AWAIT_ONLY = "awaiting_only"
+_BCAST_S_AWAIT_TEXT = "awaiting_text"
+_BCAST_S_CONFIRM = "confirm"
+
+_BCAST_INPUT_STATES = {_BCAST_S_AWAIT_EXCL, _BCAST_S_AWAIT_ONLY, _BCAST_S_AWAIT_TEXT}
+
+
+def _bcast_is_admin(user_id: int) -> bool:
+    return ADMIN_ID != 0 and user_id == ADMIN_ID
+
+
+def _parse_id_list(text: str) -> list[int]:
+    seen: set[int] = set()
+    ids: list[int] = []
+    for part in re.split(r"[\s,;]+", text.strip()):
+        if part.isdigit():
+            uid = int(part)
+            if uid not in seen:
+                seen.add(uid)
+                ids.append(uid)
+    return ids
+
+
+def _bcast_get_recipients(filter_mode: str, exclude_ids: list[int], only_ids: list[int]) -> list[int]:
+    if not USERS_FILE.exists():
+        return []
+    all_ids = [
+        int(line.strip())
+        for line in USERS_FILE.read_text(encoding="utf-8").splitlines()
+        if line.strip().isdigit()
+    ]
+    if filter_mode == "only":
+        only_set = set(only_ids)
+        return [uid for uid in all_ids if uid in only_set]
+    if filter_mode == "exclude":
+        excl_set = set(exclude_ids)
+        return [uid for uid in all_ids if uid not in excl_set]
+    return all_ids
+
+
+def _bcast_filter_keyboard(filter_mode: str) -> InlineKeyboardMarkup:
+    marks = {k: "✅ " for k in ("all", "exclude", "only")}
+    for k in marks:
+        marks[k] = ""
+    marks[filter_mode] = "✅ "
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{marks['all']}👥 Всем пользователям", callback_data="bcast:filter:all")],
+        [InlineKeyboardButton(f"{marks['exclude']}🚫 Исключить пользователей", callback_data="bcast:filter:exclude")],
+        [InlineKeyboardButton(f"{marks['only']}🎯 Только определённым", callback_data="bcast:filter:only")],
+        [
+            InlineKeyboardButton("➡️ Далее", callback_data="bcast:next"),
+            InlineKeyboardButton("❌ Отмена", callback_data="bcast:cancel"),
+        ],
+    ])
+
+
+def _bcast_filter_summary(filter_mode: str, exclude_ids: list[int], only_ids: list[int]) -> str:
+    count = len(_bcast_get_recipients(filter_mode, exclude_ids, only_ids))
+    if filter_mode == "exclude":
+        desc = f"🚫 Все кроме {len(exclude_ids)} польз. — получат <b>{count}</b> чел."
+    elif filter_mode == "only":
+        desc = f"🎯 Только {len(only_ids)} польз. — получат <b>{count}</b> чел."
+    else:
+        desc = f"👥 Всем — <b>{count}</b> чел."
+    return (
+        "📢 <b>Настройка рассылки</b>\n\n"
+        "<b>Шаг 1/2 — Получатели:</b>\n"
+        f"{desc}\n\n"
+        "Выберите фильтр или нажмите <b>Далее</b>."
+    )
+
+
+def _bcast_clear_state(user_data: dict) -> None:
+    for key in (_BCAST_STATE, _BCAST_FILTER, _BCAST_EXCLUDE, _BCAST_ONLY, _BCAST_TEXT):
+        user_data.pop(key, None)
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None or update.message.from_user is None:
+        return
+    if not _bcast_is_admin(update.message.from_user.id):
+        await update.message.reply_text("❌ Недостаточно прав.")
+        return
+
+    context.user_data[_BCAST_FILTER] = "all"
+    context.user_data[_BCAST_EXCLUDE] = []
+    context.user_data[_BCAST_ONLY] = []
+    context.user_data[_BCAST_TEXT] = ""
+    context.user_data[_BCAST_STATE] = _BCAST_S_FILTER
+
+    await update.message.reply_text(
+        _bcast_filter_summary("all", [], []),
+        parse_mode="HTML",
+        reply_markup=_bcast_filter_keyboard("all"),
+    )
+
+
+async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+
+    if not _bcast_is_admin(query.from_user.id):
+        await query.answer("❌ Недостаточно прав.", show_alert=True)
+        return
+
+    parts = (query.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    filter_mode: str = context.user_data.get(_BCAST_FILTER, "all")
+    exclude_ids: list[int] = context.user_data.get(_BCAST_EXCLUDE, [])
+    only_ids: list[int] = context.user_data.get(_BCAST_ONLY, [])
+    bcast_text: str = context.user_data.get(_BCAST_TEXT, "")
+
+    if action == "cancel":
+        _bcast_clear_state(context.user_data)
+        await query.edit_message_text("❌ Рассылка отменена.")
+        return
+
+    if action == "filter":
+        new_filter = parts[2] if len(parts) > 2 else "all"
+        context.user_data[_BCAST_FILTER] = new_filter
+        filter_mode = new_filter
+
+        if new_filter == "exclude":
+            ids_preview = (
+                f"\nТекущий список: <code>{', '.join(map(str, exclude_ids[:20]))}</code>"
+                + (f"\n... и ещё {len(exclude_ids) - 20}" if len(exclude_ids) > 20 else "")
+                if exclude_ids else "\nСписок исключений пуст."
+            )
+            await query.edit_message_text(
+                f"📢 <b>Фильтр: Исключить пользователей</b>{ids_preview}\n\n"
+                "Нажмите кнопку, чтобы ввести ID пользователей через запятую или пробел.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✏️ Ввести/изменить список ID", callback_data="bcast:enter_excl")],
+                    [InlineKeyboardButton("◀️ Назад", callback_data="bcast:back_filter"),
+                     InlineKeyboardButton("❌ Отмена", callback_data="bcast:cancel")],
+                ]),
+            )
+        elif new_filter == "only":
+            ids_preview = (
+                f"\nТекущий список: <code>{', '.join(map(str, only_ids[:20]))}</code>"
+                + (f"\n... и ещё {len(only_ids) - 20}" if len(only_ids) > 20 else "")
+                if only_ids else "\nСписок получателей пуст."
+            )
+            await query.edit_message_text(
+                f"📢 <b>Фильтр: Только определённым</b>{ids_preview}\n\n"
+                "Нажмите кнопку, чтобы ввести ID пользователей через запятую или пробел.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✏️ Ввести/изменить список ID", callback_data="bcast:enter_only")],
+                    [InlineKeyboardButton("◀️ Назад", callback_data="bcast:back_filter"),
+                     InlineKeyboardButton("❌ Отмена", callback_data="bcast:cancel")],
+                ]),
+            )
+        else:
+            await query.edit_message_text(
+                _bcast_filter_summary(filter_mode, exclude_ids, only_ids),
+                parse_mode="HTML",
+                reply_markup=_bcast_filter_keyboard(filter_mode),
+            )
+        return
+
+    if action == "back_filter":
+        context.user_data[_BCAST_STATE] = _BCAST_S_FILTER
+        await query.edit_message_text(
+            _bcast_filter_summary(filter_mode, exclude_ids, only_ids),
+            parse_mode="HTML",
+            reply_markup=_bcast_filter_keyboard(filter_mode),
+        )
+        return
+
+    if action == "enter_excl":
+        context.user_data[_BCAST_STATE] = _BCAST_S_AWAIT_EXCL
+        await query.edit_message_text(
+            "✏️ <b>Введите ID пользователей для исключения</b>\n\n"
+            "Укажите ID через запятую, пробел или с новой строки.\n"
+            "Пример: <code>123456789 987654321</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "enter_only":
+        context.user_data[_BCAST_STATE] = _BCAST_S_AWAIT_ONLY
+        await query.edit_message_text(
+            "✏️ <b>Введите ID пользователей-получателей</b>\n\n"
+            "Укажите ID через запятую, пробел или с новой строки.\n"
+            "Пример: <code>123456789 987654321</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    if action in ("next", "edit_filter"):
+        context.user_data[_BCAST_STATE] = _BCAST_S_AWAIT_TEXT
+        recipients = _bcast_get_recipients(filter_mode, exclude_ids, only_ids)
+        await query.edit_message_text(
+            f"📢 <b>Настройка рассылки</b>\n\n"
+            f"<b>Шаг 2/2 — Текст сообщения</b>\n\n"
+            f"Получатели: <b>{len(recipients)} чел.</b>\n\n"
+            "Введите текст рассылки. Поддерживается HTML: "
+            "<b>жирный</b>, <i>курсив</i>, <code>код</code>, ссылки.",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "edit":
+        context.user_data[_BCAST_STATE] = _BCAST_S_AWAIT_TEXT
+        recipients = _bcast_get_recipients(filter_mode, exclude_ids, only_ids)
+        await query.edit_message_text(
+            f"📢 <b>Редактирование текста</b>\n\n"
+            f"Получатели: <b>{len(recipients)} чел.</b>\n\n"
+            "Введите новый текст рассылки:",
+            parse_mode="HTML",
+        )
+        return
+
+    if action == "confirm":
+        recipients = _bcast_get_recipients(filter_mode, exclude_ids, only_ids)
+        if not recipients:
+            await query.edit_message_text("⚠️ Нет получателей для рассылки.")
+            return
+        if not bcast_text:
+            await query.edit_message_text("⚠️ Текст рассылки пуст.")
+            return
+
+        _bcast_clear_state(context.user_data)
+
+        await query.edit_message_text(f"📤 Отправка... 0/{len(recipients)}")
+
+        sent = 0
+        failed = 0
+        total = len(recipients)
+        for i, uid in enumerate(recipients):
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=bcast_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                sent += 1
+            except Exception as e:
+                logger.warning("Broadcast: не удалось отправить %d: %s", uid, e)
+                failed += 1
+            # Update progress every 10 messages
+            if (i + 1) % 10 == 0 or (i + 1) == total:
+                try:
+                    await query.edit_message_text(f"📤 Отправка... {i + 1}/{total}")
+                except Exception:
+                    pass
+            await asyncio.sleep(0.05)  # ~20 msg/sec
+
+        summary = f"✅ <b>Рассылка завершена!</b>\n\nОтправлено: {sent}/{total}"
+        if failed:
+            summary += f"\nНе доставлено: {failed}"
+        await query.edit_message_text(summary, parse_mode="HTML")
+
+
+async def broadcast_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles admin text input during broadcast setup flow."""
+    msg = update.message
+    if msg is None or msg.text is None:
+        return
+
+    text = msg.text.strip()
+    state: str = context.user_data.get(_BCAST_STATE, "")
+    filter_mode: str = context.user_data.get(_BCAST_FILTER, "all")
+    exclude_ids: list[int] = context.user_data.get(_BCAST_EXCLUDE, [])
+    only_ids: list[int] = context.user_data.get(_BCAST_ONLY, [])
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    if state == _BCAST_S_AWAIT_EXCL:
+        ids = _parse_id_list(text)
+        context.user_data[_BCAST_EXCLUDE] = ids
+        exclude_ids = ids
+        context.user_data[_BCAST_STATE] = _BCAST_S_FILTER
+        count = len(_bcast_get_recipients("exclude", ids, []))
+        ids_str = ', '.join(map(str, ids[:20])) + (f"\n... и ещё {len(ids)-20}" if len(ids) > 20 else "")
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text=(
+                f"📢 <b>Фильтр: Исключить пользователей</b>\n\n"
+                f"Исключено: <b>{len(ids)}</b> польз.\n"
+                f"Получат рассылку: <b>{count}</b> чел.\n\n"
+                f"ID: <code>{ids_str}</code>"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Изменить список", callback_data="bcast:enter_excl")],
+                [InlineKeyboardButton("◀️ Назад к фильтрам", callback_data="bcast:back_filter"),
+                 InlineKeyboardButton("❌ Отмена", callback_data="bcast:cancel")],
+            ]),
+        )
+
+    elif state == _BCAST_S_AWAIT_ONLY:
+        ids = _parse_id_list(text)
+        context.user_data[_BCAST_ONLY] = ids
+        only_ids = ids
+        context.user_data[_BCAST_STATE] = _BCAST_S_FILTER
+        count = len(_bcast_get_recipients("only", [], ids))
+        ids_str = ', '.join(map(str, ids[:20])) + (f"\n... и ещё {len(ids)-20}" if len(ids) > 20 else "")
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text=(
+                f"📢 <b>Фильтр: Только определённым</b>\n\n"
+                f"Указано: <b>{len(ids)}</b> польз.\n"
+                f"Найдено в базе: <b>{count}</b> чел.\n\n"
+                f"ID: <code>{ids_str}</code>"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Изменить список", callback_data="bcast:enter_only")],
+                [InlineKeyboardButton("◀️ Назад к фильтрам", callback_data="bcast:back_filter"),
+                 InlineKeyboardButton("❌ Отмена", callback_data="bcast:cancel")],
+            ]),
+        )
+
+    elif state == _BCAST_S_AWAIT_TEXT:
+        context.user_data[_BCAST_TEXT] = text
+        context.user_data[_BCAST_STATE] = _BCAST_S_CONFIRM
+        recipients = _bcast_get_recipients(filter_mode, exclude_ids, only_ids)
+        count = len(recipients)
+
+        if filter_mode == "exclude":
+            filter_info = f"🚫 Все кроме {len(exclude_ids)} польз."
+        elif filter_mode == "only":
+            filter_info = f"🎯 Только {len(only_ids)} польз."
+        else:
+            filter_info = "👥 Всем пользователям"
+
+        preview = text if len(text) <= 600 else text[:600] + "…"
+        await context.bot.send_message(
+            chat_id=msg.chat_id,
+            text=(
+                f"📢 <b>Предпросмотр рассылки</b>\n\n"
+                f"{filter_info}\n"
+                f"Получателей: <b>{count} чел.</b>\n\n"
+                f"<b>Текст:</b>\n"
+                f"<blockquote>{preview}</blockquote>"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Отправить", callback_data="bcast:confirm"),
+                    InlineKeyboardButton("✏️ Изм. текст", callback_data="bcast:edit"),
+                ],
+                [InlineKeyboardButton("⚙️ Изм. фильтр", callback_data="bcast:edit_filter")],
+                [InlineKeyboardButton("❌ Отмена", callback_data="bcast:cancel")],
+            ]),
+        )
+
+
 BOT_COMMANDS = [
     BotCommand("music",   "Поиск музыки"),
     BotCommand("ytmusic", "Скачать звук из видео"),
@@ -3484,6 +3913,8 @@ def build_application() -> Application:
 
     app.add_handler(CommandHandler("pechenyuha", pechenyuha_command))
     app.add_handler(CommandHandler("users", get_users_count))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CallbackQueryHandler(broadcast_callback, pattern=r"^bcast:"))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("music", music_command))
     app.add_handler(CommandHandler("ytmusic", ytmusic_command))
