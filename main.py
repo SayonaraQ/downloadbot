@@ -148,6 +148,7 @@ IG_TRY_NO_COOKIES_FIRST = (os.getenv("IG_TRY_NO_COOKIES_FIRST", "0").strip() != 
 
 # Network / special cases
 RU_PROXY = (os.getenv("RU_PROXY") or "").strip() or None
+YT_PROXY = (os.getenv("YT_PROXY") or RU_PROXY or "").strip() or None
 YA_PROXY = (os.getenv("YA_PROXY") or os.getenv("YANDEX_MUSIC_PROXY") or RU_PROXY or "").strip() or None
 YA_TOKEN = (os.getenv("YA_TOKEN") or "").strip() or None
 YA_COOKIES_FILES = os.getenv("YA_COOKIES_FILES") or os.getenv("YA_COOKIES_FILE")
@@ -1537,6 +1538,8 @@ def _audio_site_for_url(url: str) -> str:
 def _proxy_for_audio_site(site: str) -> str | None:
     if site == "yandex_music":
         return YA_PROXY
+    if site in ("youtube", "youtube_search"):
+        return YT_PROXY
     return None
 
 
@@ -2174,7 +2177,7 @@ def _search_music_candidates(query: str, n: int, prefix: str = "ytsearch") -> li
         if not isinstance(e, dict):
             continue
         vid_id = e.get("id") or ""
-        url = e.get("url") or e.get("webpage_url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None)
+        url = e.get("webpage_url") or e.get("url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None)
         if not url:
             continue
         results.append({
