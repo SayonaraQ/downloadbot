@@ -229,8 +229,20 @@ _last_success_cookie_lock = threading.Lock()
 # are prepared in the background and served from Telegram file_id on the next query.
 _inline_prepare_tasks: dict[str, asyncio.Task] = {}
 
-# Pending /music search sessions: session_id -> list of candidate dicts
-_music_search_sessions: dict[str, list[dict[str, Any]]] = {}
+# Pending /music search sessions: session_id -> {all, offset, page_size}
+_music_search_sessions: dict[str, dict[str, Any]] = {}
+_MUSIC_MAX_PAGES = 3
+
+
+def _session_page(session: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    all_c = session["all"]
+    offset = session["offset"]
+    size = session["page_size"]
+    page = all_c[offset:offset + size]
+    current_page = offset // size  # 0-indexed
+    pool_has_more = offset + size < len(all_c)
+    has_more = pool_has_more and (current_page < _MUSIC_MAX_PAGES - 1)
+    return page, has_more
 
 # -------------------------
 # URL patterns (keep strict behaviour: react only to supported domains)
@@ -2143,10 +2155,14 @@ async def _remove_caption_after(bot: Any, chat_id: int, message_id: int, delay: 
         pass
 
 
-def _music_search_keyboard(session_id: str, candidates: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+def _music_search_keyboard(
+    session_id: str,
+    page: list[dict[str, Any]],
+    has_more: bool = False,
+) -> InlineKeyboardMarkup:
     """Build styled inline keyboard for music search results."""
     keyboard = []
-    for i, c in enumerate(candidates):
+    for i, c in enumerate(page):
         is_sc = c.get("source") == "sc"
         dur = _fmt_duration(c.get("duration"))
         label = c["title"]
@@ -2158,6 +2174,11 @@ def _music_search_keyboard(session_id: str, candidates: list[dict[str, Any]]) ->
             label[:64],
             callback_data=f"mpick:{session_id}:{i}",
             icon_custom_emoji_id=_SC_ICON_EMOJI_ID if is_sc else _YT_ICON_EMOJI_ID,
+        )])
+    if has_more:
+        keyboard.append([InlineKeyboardButton(
+            "➡️ Ещё результаты",
+            callback_data=f"mmore:{session_id}",
         )])
     if AD_URL and AD_KEYBOARD_TEXT:
         keyboard.append([InlineKeyboardButton(
@@ -2176,9 +2197,8 @@ def _search_music_candidates(query: str, n: int, prefix: str = "ytsearch") -> li
         "extract_flat": True,
         "skip_download": True,
     }
-    fetch_n = n * 2
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f"{prefix}{fetch_n}:{query}", download=False)
+        info = ydl.extract_info(f"{prefix}{n}:{query}", download=False)
     entries = (info or {}).get("entries") or []
     results = []
     for e in entries:
@@ -2199,15 +2219,14 @@ def _search_music_candidates(query: str, n: int, prefix: str = "ytsearch") -> li
             "channel": e.get("channel") or e.get("uploader") or "",
             "duration": dur,
         })
-        if len(results) >= n:
-            break
     return results
 
 
-async def _search_music_multi_async(query: str, n_per_source: int) -> list[dict[str, Any]]:
-    """Search YouTube and SoundCloud in parallel, interleave results."""
-    yt_task = asyncio.to_thread(_search_music_candidates, query, n_per_source, "ytsearch")
-    sc_task = asyncio.to_thread(_search_music_candidates, query, n_per_source, "scsearch")
+async def _search_music_multi_async(query: str, page_size: int) -> list[dict[str, Any]]:
+    """Search YouTube and SoundCloud in parallel, return a large interleaved pool for pagination."""
+    pool_per_source = page_size * 4
+    yt_task = asyncio.to_thread(_search_music_candidates, query, pool_per_source, "ytsearch")
+    sc_task = asyncio.to_thread(_search_music_candidates, query, pool_per_source, "scsearch")
     yt_res, sc_res = await asyncio.gather(yt_task, sc_task, return_exceptions=True)
     yt = yt_res if isinstance(yt_res, list) else []
     sc = sc_res if isinstance(sc_res, list) else []
@@ -2235,13 +2254,14 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     _, session_id, idx_str = parts
-    candidates = _music_search_sessions.get(session_id)
-    if not candidates:
+    session = _music_search_sessions.get(session_id)
+    if not session:
         await cq.edit_message_text("Результаты поиска устарели. Повтори /music запрос.")
         return
 
+    page, _ = _session_page(session)
     try:
-        candidate = candidates[int(idx_str)]
+        candidate = page[int(idx_str)]
     except (ValueError, IndexError):
         await cq.edit_message_text("Неверный выбор.")
         return
@@ -2349,11 +2369,48 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     session_id = uuid.uuid4().hex[:12]
-    _music_search_sessions[session_id] = candidates
+    _music_search_sessions[session_id] = {"all": candidates, "offset": 0, "page_size": MUSIC_SEARCH_RESULTS}
+    page, has_more = _session_page(_music_search_sessions[session_id])
 
     await status_msg.edit_text(
         f"Результаты по «{source}»:",
-        reply_markup=_music_search_keyboard(session_id, candidates),
+        reply_markup=_music_search_keyboard(session_id, page, has_more),
+    )
+
+
+async def music_more_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    if cq is None:
+        return
+    await cq.answer()
+
+    parts = (cq.data or "").split(":")
+    if len(parts) != 2 or parts[0] != "mmore":
+        return
+
+    _, session_id = parts
+    session = _music_search_sessions.get(session_id)
+    if not session:
+        await cq.edit_message_text("Результаты поиска устарели. Повтори /music запрос.")
+        return
+
+    new_offset = session["offset"] + session["page_size"]
+    current_page = new_offset // session["page_size"]  # 0-indexed
+    if current_page >= _MUSIC_MAX_PAGES:
+        await cq.answer("Больше страниц нет.", show_alert=False)
+        return
+
+    session["offset"] = new_offset
+    page, pool_has_more = _session_page(session)
+    if not page:
+        await cq.answer("Больше результатов нет.", show_alert=False)
+        session["offset"] -= session["page_size"]
+        return
+
+    has_more = pool_has_more and (current_page < _MUSIC_MAX_PAGES - 1)
+
+    await cq.edit_message_reply_markup(
+        reply_markup=_music_search_keyboard(session_id, page, has_more),
     )
 
 
@@ -3201,10 +3258,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         await update.message.reply_text("Ничего не найдено.")
                         return
                     session_id = uuid.uuid4().hex[:12]
-                    _music_search_sessions[session_id] = candidates
+                    _music_search_sessions[session_id] = {"all": candidates, "offset": 0, "page_size": MUSIC_SEARCH_RESULTS}
+                    page, has_more = _session_page(_music_search_sessions[session_id])
                     await update.message.reply_text(
                         f"Результаты по «{source}»:",
-                        reply_markup=_music_search_keyboard(session_id, candidates),
+                        reply_markup=_music_search_keyboard(session_id, page, has_more),
                     )
                 except Exception as e:
                     logger.error("Ошибка поиска через ForceReply: %s", e)
@@ -3310,6 +3368,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("music", music_command))
     app.add_handler(CommandHandler("ytmusic", ytmusic_command))
     app.add_handler(CallbackQueryHandler(music_pick_callback, pattern=r"^mpick:"))
+    app.add_handler(CallbackQueryHandler(music_more_callback, pattern=r"^mmore:"))
     app.add_handler(TypeHandler(Update, handle_guest_update), group=-1)
     app.add_handler(InlineQueryHandler(handle_inline_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_cookie_document))
