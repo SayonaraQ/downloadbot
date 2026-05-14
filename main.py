@@ -172,6 +172,7 @@ AUDIO_CODEC = os.getenv("AUDIO_CODEC", "mp3").strip() or "mp3"
 AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "192").strip() or "192"
 AUDIO_SEARCH_PREFIX = os.getenv("AUDIO_SEARCH_PREFIX", "ytsearch1").strip() or "ytsearch1"
 MUSIC_SEARCH_RESULTS = max(1, min(10, int(os.getenv("MUSIC_SEARCH_RESULTS", "10"))))
+MUSIC_SESSION_TTL_SEC = max(10, int(os.getenv("MUSIC_SESSION_TTL_SEC", "60")))
 
 # Format selection (yt-dlp)
 DEFAULT_VIDEO_FORMAT = (
@@ -2058,16 +2059,65 @@ async def _get_or_download_audio_entry(
 # Telegram handlers
 # -------------------------
 
+def _fetch_sc_chart(kind: str = "top") -> list[dict[str, Any]]:
+    """Fetch SoundCloud charts (top or new). kind: 'top' or 'new'."""
+    n = MUSIC_SEARCH_RESULTS * _MUSIC_MAX_PAGES
+    url = f"https://soundcloud.com/charts/{kind}"
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "skip_download": True,
+        "playlistend": n,
+    }
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    entries = (info or {}).get("entries") or []
+    results = []
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        dur = e.get("duration")
+        if dur and dur > MAX_DURATION_SEC:
+            continue
+        if dur and dur < MIN_DURATION_SEC:
+            continue
+        entry_url = e.get("webpage_url") or e.get("url")
+        if not entry_url:
+            continue
+        results.append({
+            "url": entry_url,
+            "title": e.get("title") or "Без названия",
+            "channel": e.get("channel") or e.get("uploader") or "",
+            "duration": dur,
+            "source": "sc",
+        })
+    return results
+
+
+async def _show_sc_chart(kind: str, label: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await update.message.reply_text(f"Загружаю {label}…")
+    try:
+        candidates = await asyncio.to_thread(_fetch_sc_chart, kind)
+    except Exception as e:
+        logger.warning("SC chart '%s' failed: %s", kind, e)
+        candidates = []
+    if not candidates:
+        await msg.edit_text("Не удалось загрузить чарты. Попробуй /music запрос.")
+        return
+    session_id = _create_music_session(candidates, context.bot, msg.chat_id, msg.message_id)
+    page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
+    other_kind = "new" if kind == "top" else "top"
+    other_label = "✨ Новинки" if kind == "top" else "🔥 Топ"
+    keyboard = _music_search_keyboard(session_id, page, has_prev, has_more)
+    # Prepend chart-switch button
+    switch_row = [InlineKeyboardButton(other_label, callback_data=f"schart:{other_kind}")]
+    keyboard = InlineKeyboardMarkup([switch_row] + keyboard.inline_keyboard)
+    await msg.edit_text(f"{label} SoundCloud:", reply_markup=keyboard)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Привет, я Загружатель!\n\n"
-        "Отправь мне ссылку на Reels / пост / сторис (Instagram), TikTok, YouTube (включая Shorts) или VK — и я постараюсь прислать медиа.\n\n"
-        "Музыку можно искать командой `/music запрос` — покажу варианты с YouTube и SoundCloud, выбери нужный.\n"
-        "Для прямой загрузки по ссылке или top-1 по тексту: `/ytmusic ссылка_или_запрос`.\n"
-        "В inline-режиме: `@bot /music запрос` — выбери трек из списка, он скачается сам.\n\n"
-        "Я работаю и в групповых чатах (нужны права на чтение/отправку сообщений).",
-        parse_mode="Markdown",
-    )
+    await _show_sc_chart("top", "🔥 Топ", update, context)
 
 
 async def get_users_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2179,9 +2229,9 @@ def _music_search_keyboard(
         )])
     nav = []
     if has_prev:
-        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"mback:{session_id}"))
+        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"mback:{session_id}", style="success"))
     if has_more:
-        nav.append(InlineKeyboardButton("➡️ Ещё", callback_data=f"mmore:{session_id}"))
+        nav.append(InlineKeyboardButton("➡️ Ещё", callback_data=f"mmore:{session_id}", style="success"))
     if nav:
         keyboard.append(nav)
     if AD_URL and AD_KEYBOARD_TEXT:
@@ -2244,7 +2294,44 @@ async def _search_music_multi_async(query: str, page_size: int) -> list[dict[str
             combined.append({**yt[i], "source": "yt"})
         if i < len(sc):
             combined.append({**sc[i], "source": "sc"})
+
+    # Fallback: if too few results and query looks like "Artist - Title", retry without dash
+    if len(combined) < page_size and "-" in query:
+        alt_query = re.sub(r"\s*-\s*", " ", query).strip()
+        yt2_task = asyncio.to_thread(_search_music_candidates, alt_query, pool_per_source, "ytsearch")
+        sc2_task = asyncio.to_thread(_search_music_candidates, alt_query, pool_per_source, "scsearch")
+        yt2_res, sc2_res = await asyncio.gather(yt2_task, sc2_task, return_exceptions=True)
+        yt2 = yt2_res if isinstance(yt2_res, list) else []
+        sc2 = sc2_res if isinstance(sc2_res, list) else []
+        seen_urls = {c["url"] for c in combined}
+        extra: list[dict[str, Any]] = []
+        for i in range(max(len(yt2), len(sc2))):
+            if i < len(yt2):
+                extra.append({**yt2[i], "source": "yt"})
+            if i < len(sc2):
+                extra.append({**sc2[i], "source": "sc"})
+        for c in extra:
+            if c["url"] not in seen_urls:
+                combined.append(c)
+                seen_urls.add(c["url"])
+
     return combined
+
+
+def _create_music_session(
+    candidates: list[dict[str, Any]],
+    bot: Any,
+    chat_id: int,
+    message_id: int,
+) -> str:
+    session_id = uuid.uuid4().hex[:12]
+    session: dict[str, Any] = {"all": candidates, "offset": 0, "page_size": MUSIC_SEARCH_RESULTS}
+    _music_search_sessions[session_id] = session
+    task = asyncio.create_task(
+        _delete_message_after(bot, chat_id, message_id, MUSIC_SESSION_TTL_SEC)
+    )
+    session["delete_task"] = task
+    return session_id
 
 
 async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2285,7 +2372,11 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await cq.edit_message_text(f"Не удалось загрузить «{title}».")
             return
 
-    _music_search_sessions.pop(session_id, None)
+    popped = _music_search_sessions.pop(session_id, None)
+    if popped:
+        task = popped.get("delete_task")
+        if task and not task.done():
+            task.cancel()
 
     key = str(entry["key"])
     d = _cache_dir_for_key(key)
@@ -2372,10 +2463,8 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await status_msg.edit_text("Ничего не найдено.")
         return
 
-    session_id = uuid.uuid4().hex[:12]
-    _music_search_sessions[session_id] = {"all": candidates, "offset": 0, "page_size": MUSIC_SEARCH_RESULTS}
+    session_id = _create_music_session(candidates, context.bot, status_msg.chat_id, status_msg.message_id)
     page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
-
     await status_msg.edit_text(
         f"Результаты по «{source}»:",
         reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
@@ -2442,6 +2531,42 @@ async def music_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await cq.edit_message_reply_markup(
         reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
     )
+
+
+async def sc_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    if cq is None:
+        return
+    await cq.answer()
+
+    parts = (cq.data or "").split(":")
+    if len(parts) != 2 or parts[0] != "schart":
+        return
+    kind = parts[1]
+    if kind not in ("top", "new"):
+        return
+
+    label = "🔥 Топ" if kind == "top" else "✨ Новинки"
+    await cq.edit_message_text(f"Загружаю {label}…")
+    try:
+        candidates = await asyncio.to_thread(_fetch_sc_chart, kind)
+    except Exception as e:
+        logger.warning("SC chart '%s' failed: %s", kind, e)
+        candidates = []
+    if not candidates:
+        await cq.edit_message_text("Не удалось загрузить чарты.")
+        return
+
+    chat_id = cq.message.chat_id
+    message_id = cq.message.message_id
+    session_id = _create_music_session(candidates, context.bot, chat_id, message_id)
+    page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
+    other_kind = "new" if kind == "top" else "top"
+    other_label = "✨ Новинки" if kind == "top" else "🔥 Топ"
+    switch_row = [InlineKeyboardButton(other_label, callback_data=f"schart:{other_kind}")]
+    keyboard = _music_search_keyboard(session_id, page, has_prev, has_more)
+    keyboard = InlineKeyboardMarkup([switch_row] + keyboard.inline_keyboard)
+    await cq.edit_message_text(f"{label} SoundCloud:", reply_markup=keyboard)
 
 
 def _extract_ytmusic_command_payload(text: str) -> str:
@@ -3287,11 +3412,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     if not candidates:
                         await update.message.reply_text("Ничего не найдено.")
                         return
-                    session_id = uuid.uuid4().hex[:12]
-                    _music_search_sessions[session_id] = {"all": candidates, "offset": 0, "page_size": MUSIC_SEARCH_RESULTS}
+                    sent = await update.message.reply_text(f"Результаты по «{source}»:", reply_markup=InlineKeyboardMarkup([]))
+                    session_id = _create_music_session(candidates, context.bot, sent.chat_id, sent.message_id)
                     page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
-                    await update.message.reply_text(
-                        f"Результаты по «{source}»:",
+                    await context.bot.edit_message_reply_markup(
+                        chat_id=sent.chat_id,
+                        message_id=sent.message_id,
                         reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
                     )
                 except Exception as e:
@@ -3370,6 +3496,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text("Не удалось загрузить музыку.")
             return
 
+        # 4) In private chats: any non-URL text → music search
+        if update.message.chat.type == "private" and not _looks_like_url(text):
+            status_msg = await update.message.reply_text("Ищу…")
+            try:
+                candidates = await _search_music_multi_async(text, MUSIC_SEARCH_RESULTS)
+            except Exception as e:
+                logger.error("Ошибка поиска музыки: %s", e)
+                await status_msg.edit_text("Не удалось выполнить поиск.")
+                return
+            if not candidates:
+                await status_msg.edit_text("Ничего не найдено.")
+                return
+            session_id = _create_music_session(candidates, context.bot, status_msg.chat_id, status_msg.message_id)
+            page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
+            await status_msg.edit_text(
+                f"Результаты по «{text}»:",
+                reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
+            )
+            return
+
         # Otherwise ignore
         return
 
@@ -3400,6 +3546,7 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(music_pick_callback, pattern=r"^mpick:"))
     app.add_handler(CallbackQueryHandler(music_more_callback, pattern=r"^mmore:"))
     app.add_handler(CallbackQueryHandler(music_back_callback, pattern=r"^mback:"))
+    app.add_handler(CallbackQueryHandler(sc_chart_callback, pattern=r"^schart:"))
     app.add_handler(TypeHandler(Update, handle_guest_update), group=-1)
     app.add_handler(InlineQueryHandler(handle_inline_query))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_cookie_document))
