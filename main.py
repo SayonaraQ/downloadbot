@@ -1246,8 +1246,8 @@ async def _send_single_item(
     parse_mode: str | None = None,
     audio_title: str | None = None,
     audio_performer: str | None = None,
-) -> str:
-    """Send one media item. Returns Telegram file_id."""
+) -> tuple[str, int]:
+    """Send one media item. Returns (tg_file_id, message_id)."""
     chat_id = update.effective_chat.id
 
     if isinstance(media, Path):
@@ -1268,22 +1268,22 @@ async def _send_single_item(
     if media_path is None and isinstance(media, str) and not os.path.exists(media):
         if kind == "photo":
             msg = await context.bot.send_photo(chat_id=chat_id, photo=media, caption=caption, parse_mode=parse_mode)
-            return msg.photo[-1].file_id
+            return msg.photo[-1].file_id, msg.message_id
         if kind == "video":
             msg = await context.bot.send_video(chat_id=chat_id, video=media, caption=caption, parse_mode=parse_mode, supports_streaming=True)
-            return msg.video.file_id
+            return msg.video.file_id, msg.message_id
         if kind == "audio":
             msg = await context.bot.send_audio(chat_id=chat_id, audio=media, caption=caption, parse_mode=parse_mode, **audio_kwargs)
-            return msg.audio.file_id
+            return msg.audio.file_id, msg.message_id
         msg = await context.bot.send_document(chat_id=chat_id, document=media, caption=caption, parse_mode=parse_mode)
-        return msg.document.file_id
+        return msg.document.file_id, msg.message_id
 
     # Otherwise send local file
     assert media_path is not None
     with media_path.open("rb") as f:
         if kind == "photo":
             msg = await update.message.reply_photo(photo=f, caption=caption, parse_mode=parse_mode)
-            return msg.photo[-1].file_id
+            return msg.photo[-1].file_id, msg.message_id
         if kind == "video":
             msg = await update.message.reply_video(
                 video=f,
@@ -1292,12 +1292,12 @@ async def _send_single_item(
                 supports_streaming=True,
                 **_video_upload_kwargs(media_path),
             )
-            return msg.video.file_id
+            return msg.video.file_id, msg.message_id
         if kind == "audio":
             msg = await update.message.reply_audio(audio=f, caption=caption, parse_mode=parse_mode, **audio_kwargs)
-            return msg.audio.file_id
+            return msg.audio.file_id, msg.message_id
         msg = await update.message.reply_document(document=f, caption=caption, parse_mode=parse_mode)
-        return msg.document.file_id
+        return msg.document.file_id, msg.message_id
 
 
 async def _send_media_group(
@@ -1326,7 +1326,7 @@ async def _send_media_group(
     # Decide if we can use file_ids entirely
     can_use_file_ids = all(it.get("tg_file_id") and isinstance(it.get("tg_file_id"), str) for it in items)
 
-    async def _send_one(it: dict[str, Any], *, i: int) -> str:
+    async def _send_one(it: dict[str, Any], *, i: int) -> tuple[str, int]:
         kind = it.get("kind")
         tg_file_id = it.get("tg_file_id")
         abs_path = it.get("abs_path")
@@ -1343,12 +1343,12 @@ async def _send_media_group(
             )
 
         if not abs_path:
-            return ""
+            return "", 0
 
         path = Path(abs_path)
         if not path.exists() or not path.is_file():
             logger.warning("Файл для отправки не найден: %s", str(path))
-            return ""
+            return "", 0
 
         return await _send_single_item(
             update,
@@ -1417,16 +1417,20 @@ async def _send_media_group(
     except Exception as e:
         logger.warning("sendMediaGroup не удался (%s). Отправляю по одному.", str(e))
 
-    # Fallback: send one-by-one (no message_id tracking)
+    # Fallback: send one-by-one
     out: list[str] = []
+    first_msg_id: int | None = None
     for i, it in enumerate(items):
         try:
-            out.append(await _send_one(it, i=i))
+            fid, mid = await _send_one(it, i=i)
+            out.append(fid)
+            if i == 0 and mid:
+                first_msg_id = mid
         except Exception as e:
             logger.warning("Не удалось отправить элемент %d/%d: %s", i + 1, len(items), str(e))
             out.append("")
 
-    return out, None
+    return out, first_msg_id
 
 
 async def send_cache_entry(
@@ -1512,7 +1516,7 @@ async def send_cache_entry(
                     msg.document.file_id if msg.document else "")
             first_caption_message_id = msg.message_id
         else:
-            fid = await _send_single_item(
+            fid, _ = await _send_single_item(
                 update, context,
                 kind=kind,
                 media=tg_file_id if tg_file_id else Path(abs_path),
