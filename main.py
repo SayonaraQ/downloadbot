@@ -2085,12 +2085,31 @@ _NON_LATIN_SCRIPT_RANGES = (
 )
 
 
+# Symbols exclusive to Ukrainian Cyrillic (absent in Russian)
+_UKRAINIAN_CHARS = frozenset("іїєґІЇЄҐ")
+
+# Phrases to hard-block from chart results (lowercase, matched case-insensitively)
+_CHART_BLOCKED_PHRASES = frozenset(["горит москва"])
+
+
 def _has_non_latin_script(text: str) -> bool:
     for ch in text:
         cp = ord(ch)
         for lo, hi in _NON_LATIN_SCRIPT_RANGES:
             if lo <= cp <= hi:
                 return True
+    return False
+
+
+def _should_exclude_chart_track(title: str, artist: str = "") -> bool:
+    """Return True if this track should be excluded from chart results."""
+    combined = f"{title} {artist}".lower()
+    if _has_non_latin_script(title) or _has_non_latin_script(artist):
+        return True
+    if any(ch in _UKRAINIAN_CHARS for ch in title + artist):
+        return True
+    if any(phrase in combined for phrase in _CHART_BLOCKED_PHRASES):
+        return True
     return False
 
 
@@ -2184,13 +2203,13 @@ def _fetch_sc_playlist_api(url: str, n: int) -> list[dict[str, Any]]:
             if dur_sec and (dur_sec > MAX_DURATION_SEC or dur_sec < MIN_DURATION_SEC):
                 continue
             title = getattr(track, "title", "") or ""
-            if not title or _has_non_latin_script(title):
+            user = getattr(track, "user", None)
+            artist = getattr(user, "username", "") if user else ""
+            if not title or _should_exclude_chart_track(title, artist):
                 continue
             track_url = getattr(track, "permalink_url", "") or ""
             if not track_url:
                 continue
-            user = getattr(track, "user", None)
-            artist = getattr(user, "username", "") if user else ""
             results.append({
                 "url": track_url,
                 "title": title,
@@ -2670,7 +2689,7 @@ async def sc_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 candidates = [
                     {**c, "source": "sc"}
                     for c in raw
-                    if not _has_non_latin_script(c.get("title", ""))
+                    if not _should_exclude_chart_track(c.get("title", ""), c.get("channel", ""))
                 ]
             except Exception as e:
                 logger.warning("Chart 'new' fallback search failed: %s", e)
