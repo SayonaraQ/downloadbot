@@ -2137,11 +2137,15 @@ def _fetch_yandex_chart(n: int) -> list[dict[str, Any]]:
 
 
 def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
-    """Fetch tracks from a SoundCloud chart page URL via yt-dlp."""
+    """Fetch tracks from a SoundCloud playlist/chart URL via yt-dlp.
+
+    extract_flat is intentionally disabled: SoundCloud playlist stubs don't
+    include track titles in flat mode, so we need full per-track extraction.
+    playlistend limits the number of API calls to n.
+    """
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": True,
         "skip_download": True,
         "playlistend": n,
     }
@@ -2155,16 +2159,14 @@ def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
     for e in entries:
         if not isinstance(e, dict):
             continue
-        # Chart pages often omit duration in flat extraction — skip only if
-        # duration is explicitly present and out of range (not when it's absent)
         dur = e.get("duration")
         if dur and (dur > MAX_DURATION_SEC or dur < MIN_DURATION_SEC):
             continue
         track_url = e.get("webpage_url") or e.get("url")
         if not track_url:
             continue
-        title = e.get("title") or "Без названия"
-        if _has_non_latin_script(title):
+        title = e.get("title") or ""
+        if not title or _has_non_latin_script(title):
             continue
         results.append({
             "url": track_url,
