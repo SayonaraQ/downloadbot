@@ -2136,25 +2136,40 @@ def _fetch_yandex_chart(n: int) -> list[dict[str, Any]]:
         return []
 
 
-def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
-    """Fetch tracks from a SoundCloud playlist/chart URL via yt-dlp.
+def _title_from_sc_url(url: str) -> str:
+    """Derive a readable title from a SoundCloud track URL slug as last resort."""
+    try:
+        slug = url.rstrip("/").split("/")[-1]
+        slug = re.sub(r"-\d+$", "", slug)
+        return slug.replace("-", " ").title()
+    except Exception:
+        return ""
 
-    extract_flat is intentionally disabled: SoundCloud playlist stubs don't
-    include track titles in flat mode, so we need full per-track extraction.
-    playlistend limits the number of API calls to n.
+
+def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
+    """Fetch tracks from a SoundCloud playlist URL via yt-dlp (flat mode).
+
+    Uses extract_flat=True for speed. Titles missing from flat stubs are
+    derived from the track URL slug.
     """
     opts = {
         "quiet": True,
         "no_warnings": True,
+        "extract_flat": True,
         "skip_download": True,
         "playlistend": n,
     }
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
-    except Exception:
+    except Exception as e:
+        logger.warning("SC playlist fetch error for %s: %s", url, e)
         return []
-    entries = (info or {}).get("entries") or []
+    if not info:
+        logger.warning("SC playlist fetch returned nothing for %s", url)
+        return []
+    entries = info.get("entries") or []
+    logger.info("SC playlist '%s': got %d raw entries", url, len(entries))
     results = []
     for e in entries:
         if not isinstance(e, dict):
@@ -2165,7 +2180,7 @@ def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
         track_url = e.get("webpage_url") or e.get("url")
         if not track_url:
             continue
-        title = e.get("title") or ""
+        title = e.get("title") or _title_from_sc_url(track_url)
         if not title or _has_non_latin_script(title):
             continue
         results.append({
@@ -2175,6 +2190,7 @@ def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
             "duration": dur or 0,
             "source": "sc",
         })
+    logger.info("SC playlist '%s': %d tracks after filtering", url, len(results))
     return results
 
 
