@@ -2320,6 +2320,13 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = cq.message.chat_id
     requester_id = cq.from_user.id if cq.from_user else None
 
+    # Cancel auto-delete immediately so it doesn't fire during download
+    popped = _music_search_sessions.pop(session_id, None)
+    if popped:
+        task = popped.get("delete_task")
+        if task and not task.done():
+            task.cancel()
+
     await cq.edit_message_text(f"Скачиваю: {title}…")
 
     async with sema:
@@ -2329,12 +2336,6 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.error("Ошибка при загрузке трека по выбору: %s", e)
             await cq.edit_message_text(f"Не удалось загрузить «{title}».")
             return
-
-    popped = _music_search_sessions.pop(session_id, None)
-    if popped:
-        task = popped.get("delete_task")
-        if task and not task.done():
-            task.cancel()
 
     key = str(entry["key"])
     d = _cache_dir_for_key(key)
@@ -3362,24 +3363,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if source:
             if update.message.chat_id:
                 save_user(update.message.chat_id)
-            requester_id = update.effective_user.id if update.effective_user else None
-            async with sema:
-                try:
-                    candidates = await _search_music_multi_async(source, MUSIC_SEARCH_RESULTS)
-                    if not candidates:
-                        await update.message.reply_text("Ничего не найдено.")
-                        return
-                    sent = await update.message.reply_text(f"Результаты по «{source}»:", reply_markup=InlineKeyboardMarkup([]))
-                    session_id = _create_music_session(candidates, context.bot, sent.chat_id, sent.message_id)
-                    page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
-                    await context.bot.edit_message_reply_markup(
-                        chat_id=sent.chat_id,
-                        message_id=sent.message_id,
-                        reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
-                    )
-                except Exception as e:
-                    logger.error("Ошибка поиска через ForceReply: %s", e)
-                    await update.message.reply_text("Не удалось выполнить поиск.")
+            try:
+                candidates = await _search_music_multi_async(source, MUSIC_SEARCH_RESULTS)
+                if not candidates:
+                    await update.message.reply_text("Ничего не найдено.")
+                    return
+                sent = await update.message.reply_text(f"Результаты по «{source}»:", reply_markup=InlineKeyboardMarkup([]))
+                session_id = _create_music_session(candidates, context.bot, sent.chat_id, sent.message_id)
+                page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
+                await context.bot.edit_message_reply_markup(
+                    chat_id=sent.chat_id,
+                    message_id=sent.message_id,
+                    reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
+                )
+            except Exception as e:
+                logger.error("Ошибка поиска через ForceReply: %s", e)
+                await update.message.reply_text("Не удалось выполнить поиск.")
         return
 
     text, was_mentioned = await _normalize_mention_text(update.message.text, context)
@@ -3403,6 +3402,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         cleanup_cache()
     except Exception:
         pass
+
+    # 4) In private chats: any non-URL text → music search (outside sema — no download)
+    if update.message.chat.type == "private" and not _looks_like_url(text) and not MUSIC_PATTERN.match(text) and not _extract_inline_music_source(text):
+        status_msg = await update.message.reply_text("Ищу…")
+        try:
+            candidates = await _search_music_multi_async(text, MUSIC_SEARCH_RESULTS)
+        except Exception as e:
+            logger.error("Ошибка поиска музыки: %s", e)
+            await status_msg.edit_text("Не удалось выполнить поиск.")
+            return
+        if not candidates:
+            await status_msg.edit_text("Ничего не найдено.")
+            return
+        session_id = _create_music_session(candidates, context.bot, status_msg.chat_id, status_msg.message_id)
+        page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
+        await status_msg.edit_text(
+            f"Результаты по «{text}»:",
+            reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
+        )
+        return
 
     async with sema:
         # 1) Music URLs and /music routed audio-only requests
@@ -3441,7 +3460,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
             return
 
-        # 3) Music by query
+        # 3) Music by query pattern
         if MUSIC_PATTERN.match(text):
             try:
                 entry = await _get_or_download_audio_entry(text, requester_id=requester_id)
@@ -3451,26 +3470,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception as e:
                 logger.error("Ошибка при загрузке музыки: %s", e)
                 await update.message.reply_text("Не удалось загрузить музыку.")
-            return
-
-        # 4) In private chats: any non-URL text → music search
-        if update.message.chat.type == "private" and not _looks_like_url(text):
-            status_msg = await update.message.reply_text("Ищу…")
-            try:
-                candidates = await _search_music_multi_async(text, MUSIC_SEARCH_RESULTS)
-            except Exception as e:
-                logger.error("Ошибка поиска музыки: %s", e)
-                await status_msg.edit_text("Не удалось выполнить поиск.")
-                return
-            if not candidates:
-                await status_msg.edit_text("Ничего не найдено.")
-                return
-            session_id = _create_music_session(candidates, context.bot, status_msg.chat_id, status_msg.message_id)
-            page, has_prev, has_more = _session_page(_music_search_sessions[session_id])
-            await status_msg.edit_text(
-                f"Результаты по «{text}»:",
-                reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more),
-            )
             return
 
         # Otherwise ignore
