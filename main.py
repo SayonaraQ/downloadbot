@@ -2139,7 +2139,9 @@ def _fetch_yandex_chart(n: int) -> list[dict[str, Any]]:
 def _fetch_sc_playlist_api(url: str, n: int) -> list[dict[str, Any]]:
     """Fetch SoundCloud playlist via soundcloud-v2 unofficial API (no key needed).
 
-    Returns full track metadata including proper titles.
+    SoundCloud API returns full track objects only for some "preloaded" tracks;
+    the rest are MiniTrack stubs with only an id. We collect stub ids and fetch
+    their full metadata in one batch call via get_tracks().
     """
     try:
         from soundcloud import SoundCloud  # type: ignore
@@ -2152,10 +2154,32 @@ def _fetch_sc_playlist_api(url: str, n: int) -> list[dict[str, Any]]:
         if not playlist or not hasattr(playlist, "tracks"):
             logger.warning("SC API resolve returned no playlist for %s", url)
             return []
+
+        playlist_id = getattr(playlist, "id", None)
+        raw_tracks = list(playlist.tracks or [])[:n]
+
+        # Split: full tracks (have permalink_url) vs mini stubs (only id)
+        full: list[Any] = []
+        mini_ids: list[int] = []
+        for t in raw_tracks:
+            if getattr(t, "permalink_url", None):
+                full.append(t)
+            else:
+                tid = getattr(t, "id", None)
+                if tid:
+                    mini_ids.append(tid)
+
+        # Fetch full metadata for stubs in one API call
+        if mini_ids:
+            try:
+                fetched = sc.get_tracks(mini_ids, playlistId=playlist_id) or []
+                full.extend(fetched)
+                logger.info("SC API: fetched %d/%d mini tracks for playlist", len(fetched), len(mini_ids))
+            except Exception as e:
+                logger.warning("SC get_tracks batch failed: %s", e)
+
         results = []
-        for track in (playlist.tracks or [])[:n]:
-            if not track or not hasattr(track, "title"):
-                continue
+        for track in full:
             dur_sec = (getattr(track, "duration", None) or 0) / 1000
             if dur_sec and (dur_sec > MAX_DURATION_SEC or dur_sec < MIN_DURATION_SEC):
                 continue
@@ -2174,7 +2198,7 @@ def _fetch_sc_playlist_api(url: str, n: int) -> list[dict[str, Any]]:
                 "duration": dur_sec,
                 "source": "sc",
             })
-        logger.info("SC API playlist '%s': %d tracks", url, len(results))
+        logger.info("SC API playlist '%s': %d tracks after filtering", url, len(results))
         return results
     except Exception as e:
         logger.warning("SC API playlist fetch failed for %s: %s", url, e)
