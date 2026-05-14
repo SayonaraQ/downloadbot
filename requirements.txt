@@ -3,3 +3,4 @@ yt-dlp
 python-dotenv
 requests[socks]
 yandex-music
+soundcloud-v2

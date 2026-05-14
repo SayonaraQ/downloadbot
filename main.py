@@ -2136,62 +2136,49 @@ def _fetch_yandex_chart(n: int) -> list[dict[str, Any]]:
         return []
 
 
-def _title_from_sc_url(url: str) -> str:
-    """Derive a readable title from a SoundCloud track URL slug as last resort."""
-    try:
-        slug = url.rstrip("/").split("/")[-1]
-        slug = re.sub(r"-\d+$", "", slug)
-        return slug.replace("-", " ").title()
-    except Exception:
-        return ""
+def _fetch_sc_playlist_api(url: str, n: int) -> list[dict[str, Any]]:
+    """Fetch SoundCloud playlist via soundcloud-v2 unofficial API (no key needed).
 
-
-def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
-    """Fetch tracks from a SoundCloud playlist URL via yt-dlp (flat mode).
-
-    Uses extract_flat=True for speed. Titles missing from flat stubs are
-    derived from the track URL slug.
+    Returns full track metadata including proper titles.
     """
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "skip_download": True,
-        "playlistend": n,
-    }
     try:
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        from soundcloud import SoundCloud  # type: ignore
+    except ImportError:
+        logger.warning("soundcloud-v2 not installed")
+        return []
+    try:
+        sc = SoundCloud()
+        playlist = sc.resolve(url)
+        if not playlist or not hasattr(playlist, "tracks"):
+            logger.warning("SC API resolve returned no playlist for %s", url)
+            return []
+        results = []
+        for track in (playlist.tracks or [])[:n]:
+            if not track or not hasattr(track, "title"):
+                continue
+            dur_sec = (getattr(track, "duration", None) or 0) / 1000
+            if dur_sec and (dur_sec > MAX_DURATION_SEC or dur_sec < MIN_DURATION_SEC):
+                continue
+            title = getattr(track, "title", "") or ""
+            if not title or _has_non_latin_script(title):
+                continue
+            track_url = getattr(track, "permalink_url", "") or ""
+            if not track_url:
+                continue
+            user = getattr(track, "user", None)
+            artist = getattr(user, "username", "") if user else ""
+            results.append({
+                "url": track_url,
+                "title": title,
+                "channel": artist,
+                "duration": dur_sec,
+                "source": "sc",
+            })
+        logger.info("SC API playlist '%s': %d tracks", url, len(results))
+        return results
     except Exception as e:
-        logger.warning("SC playlist fetch error for %s: %s", url, e)
+        logger.warning("SC API playlist fetch failed for %s: %s", url, e)
         return []
-    if not info:
-        logger.warning("SC playlist fetch returned nothing for %s", url)
-        return []
-    entries = info.get("entries") or []
-    logger.info("SC playlist '%s': got %d raw entries", url, len(entries))
-    results = []
-    for e in entries:
-        if not isinstance(e, dict):
-            continue
-        dur = e.get("duration")
-        if dur and (dur > MAX_DURATION_SEC or dur < MIN_DURATION_SEC):
-            continue
-        track_url = e.get("webpage_url") or e.get("url")
-        if not track_url:
-            continue
-        title = e.get("title") or _title_from_sc_url(track_url)
-        if not title or _has_non_latin_script(title):
-            continue
-        results.append({
-            "url": track_url,
-            "title": title,
-            "channel": e.get("channel") or e.get("uploader") or "",
-            "duration": dur or 0,
-            "source": "sc",
-        })
-    logger.info("SC playlist '%s': %d tracks after filtering", url, len(results))
-    return results
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2649,13 +2636,11 @@ async def sc_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             logger.warning("Chart 'top': Yandex Music chart returned nothing (YA_TOKEN set: %s)", bool(YA_TOKEN))
 
     else:  # "new"
-        # Кураторский SoundCloud плейлист
-        candidates = await asyncio.to_thread(_fetch_sc_chart_url, _SC_NEW_PLAYLIST_URL, pool)
-        if candidates:
-            logger.info("Chart 'new': got %d tracks from SC playlist", len(candidates))
-        else:
-            # Fallback to search
-            logger.info("Chart 'new': playlist empty, falling back to search")
+        # Кураторский SoundCloud плейлист через soundcloud-v2 API
+        candidates = await asyncio.to_thread(_fetch_sc_playlist_api, _SC_NEW_PLAYLIST_URL, pool)
+        if not candidates:
+            # Fallback: yt-dlp search с фильтром нелатинских скриптов
+            logger.info("Chart 'new': API fetch empty, falling back to search")
             try:
                 raw = await asyncio.to_thread(_search_music_candidates, _SC_NEW_FALLBACK_QUERY, pool, "scsearch")
                 candidates = [
