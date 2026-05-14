@@ -2460,6 +2460,34 @@ def _create_music_session(
     return session_id
 
 
+def _is_track_unavailable(err: str) -> bool:
+    e = err.lower()
+    return any(k in e for k in ("404", "not found", "not available", "unavailable", "private", "deleted"))
+
+
+def _search_yandex_music_url(query: str) -> str | None:
+    """Search Yandex Music for a track and return its URL, or None."""
+    if not YA_TOKEN:
+        return None
+    try:
+        from yandex_music import Client as _YMClient
+        from yandex_music.utils.request import Request as _YMRequest
+        proxy = YA_PROXY or RU_PROXY
+        request = _YMRequest(proxy_url=proxy) if proxy else None
+        client = _YMClient(YA_TOKEN, request=request).init()
+        result = client.search(query, type_="track")
+        if not result or not result.tracks or not result.tracks.results:
+            return None
+        track = result.tracks.results[0]
+        albums = track.albums or []
+        if not albums:
+            return None
+        return f"https://music.yandex.ru/album/{albums[0].id}/track/{track.id}"
+    except Exception as e:
+        logger.warning("Yandex Music search failed for '%s': %s", query, e)
+        return None
+
+
 async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cq = update.callback_query
     if cq is None:
@@ -2495,34 +2523,57 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if task and not task.done():
             task.cancel()
 
-    await cq.edit_message_text(f"Скачиваю: {title}…")
     channel = candidate.get("channel", "")
+    source = candidate.get("source", "")
+    search_query = f"{channel} - {title}" if channel else title
+    await cq.edit_message_text(f"Скачиваю: {title}…")
 
     async with sema:
+        entry = None
+
+        # Attempt 1 — original URL
         try:
             entry = await _get_or_download_audio_entry(url, requester_id=requester_id)
         except Exception as e:
-            err_lower = str(e).lower()
-            is_404 = "404" in err_lower or "not found" in err_lower
-            if is_404 and candidate.get("source") == "sc":
-                # SoundCloud track unavailable — retry via YouTube search by title
-                search_query = f"{channel} - {title}" if channel else title
-                logger.warning(
-                    "SC track 404, retrying via YouTube search: %s", search_query
-                )
-                await cq.edit_message_text(f"Трек недоступен на SoundCloud, ищу на YouTube…")
-                try:
-                    entry = await _get_or_download_audio_entry(
-                        search_query, requester_id=requester_id
-                    )
-                except Exception as e2:
-                    logger.error("YouTube fallback тоже провалился: %s", e2)
-                    await cq.edit_message_text(f"Не удалось загрузить «{title}».")
-                    return
-            else:
-                logger.error("Ошибка при загрузке трека по выбору: %s", e)
+            if not _is_track_unavailable(str(e)):
+                logger.error("Ошибка при загрузке трека: %s", e)
                 await cq.edit_message_text(f"Не удалось загрузить «{title}».")
                 return
+            logger.warning("Track unavailable (%s), trying fallbacks for: %s", source, search_query)
+
+        # Attempt 2 — YouTube search (skip if original was YouTube)
+        if entry is None and source != "yt":
+            try:
+                await cq.edit_message_text(f"Ищу на YouTube: {title}…")
+                entry = await _get_or_download_audio_entry(
+                    f"ytsearch1:{search_query}", requester_id=requester_id
+                )
+            except Exception as e:
+                logger.warning("YouTube fallback failed: %s", e)
+
+        # Attempt 3 — SoundCloud search (skip if original was SoundCloud)
+        if entry is None and source != "sc":
+            try:
+                await cq.edit_message_text(f"Ищу на SoundCloud: {title}…")
+                entry = await _get_or_download_audio_entry(
+                    f"scsearch1:{search_query}", requester_id=requester_id
+                )
+            except Exception as e:
+                logger.warning("SoundCloud fallback failed: %s", e)
+
+        # Attempt 4 — Yandex Music search
+        if entry is None and YA_TOKEN:
+            try:
+                await cq.edit_message_text(f"Ищу на Яндекс.Музыке: {title}…")
+                ym_url = await asyncio.to_thread(_search_yandex_music_url, search_query)
+                if ym_url:
+                    entry = await _get_or_download_audio_entry(ym_url, requester_id=requester_id)
+            except Exception as e:
+                logger.warning("Yandex Music fallback failed: %s", e)
+
+        if entry is None:
+            await cq.edit_message_text(f"Трек «{title}» недоступен ни на одной платформе.")
+            return
 
     key = str(entry["key"])
     d = _cache_dir_for_key(key)
