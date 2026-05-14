@@ -2262,6 +2262,148 @@ async def get_users_count(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("⚠ Ошибка при подсчёте пользователей.")
 
 
+# -------------------------
+# Admin: stats & cookie health check
+# -------------------------
+
+_SITE_LABELS: dict[str, str] = {
+    "instagram": "Instagram",
+    "tiktok": "TikTok",
+    "youtube": "YouTube",
+    "youtube_search": "YouTube (поиск)",
+    "soundcloud": "SoundCloud",
+    "yandex_music": "Яндекс.Музыка",
+    "vk": "VK",
+}
+
+
+def _collect_cache_stats() -> dict[str, Any]:
+    audio_count = 0
+    video_count = 0
+    by_site: dict[str, int] = {}
+    for entry in list(_cache_index.values()):
+        if _is_entry_expired(entry):
+            continue
+        items = entry.get("items") or []
+        kinds = {it.get("kind") for it in items if isinstance(it, dict)}
+        site = entry.get("site") or "unknown"
+        if "audio" in kinds:
+            audio_count += 1
+        else:
+            video_count += 1
+        by_site[site] = by_site.get(site, 0) + 1
+    return {"audio": audio_count, "video": video_count, "by_site": by_site}
+
+
+def _cache_dir_size_mb() -> float:
+    total = 0
+    try:
+        for p in CACHE_DIR.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return total / (1024 * 1024)
+
+
+def _check_ig_cookie_file(cookiefile: str) -> tuple[bool, str]:
+    """Check Instagram cookie validity by inspecting sessionid expiry. Returns (ok, status)."""
+    try:
+        cj = cookiejar.MozillaCookieJar()
+        cj.load(cookiefile, ignore_expires=True, ignore_discard=True)
+        now = time.time()
+        for cookie in cj:
+            if cookie.domain in (".instagram.com", "instagram.com") and cookie.name == "sessionid":
+                if cookie.expires and cookie.expires < now:
+                    import datetime as _dt
+                    exp = _dt.datetime.fromtimestamp(cookie.expires).strftime("%Y-%m-%d")
+                    return False, f"sessionid истёк {exp}"
+                return True, "OK"
+        return False, "нет sessionid"
+    except Exception as e:
+        return False, str(e)[:80]
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if ADMIN_ID and update.message.chat_id != ADMIN_ID:
+        await update.message.reply_text("❌ У вас нет прав.")
+        return
+
+    # Users
+    users_count = 0
+    try:
+        if USERS_FILE.exists():
+            users_count = len([l for l in USERS_FILE.read_text(encoding="utf-8").splitlines() if l.strip()])
+    except Exception:
+        pass
+
+    # Cache
+    stats = _collect_cache_stats()
+    total_entries = stats["audio"] + stats["video"]
+    size_mb = _cache_dir_size_mb()
+    size_str = f"{size_mb / 1024:.1f} GB" if size_mb >= 1024 else f"{size_mb:.0f} MB"
+
+    by_site_lines = ""
+    for site, count in sorted(stats["by_site"].items(), key=lambda x: -x[1]):
+        label = _SITE_LABELS.get(site, site)
+        by_site_lines += f"  ▪ {label}: {count}\n"
+
+    # Instagram cookies
+    _ensure_dirs()
+    cookie_files = sorted(IG_USER_COOKIES_DIR.glob("user_*.txt"))
+    cookie_lines = ""
+    if cookie_files:
+        for cf in cookie_files:
+            ok, status = _check_ig_cookie_file(str(cf))
+            icon = "✅" if ok else "❌"
+            cookie_lines += f"  {icon} {cf.name} — {status}\n"
+    else:
+        cookie_lines = "  нет загруженных cookies\n"
+
+    text = (
+        f"<b>📊 Статистика бота</b>\n\n"
+        f"<b>👥 Пользователей:</b> {users_count:,}\n\n"
+        f"<b>📦 Кэш:</b> {total_entries} записей · {size_str}\n"
+        f"  🎵 Аудио: {stats['audio']}\n"
+        f"  🎬 Видео/фото: {stats['video']}\n\n"
+        f"<b>📈 По источникам:</b>\n{by_site_lines}\n"
+        f"<b>🍪 Instagram cookies:</b>\n{cookie_lines}"
+    )
+    await update.message.reply_text(text.strip(), parse_mode="HTML")
+
+
+async def cookie_health_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Daily job: check all IG cookies and notify admin about expired ones."""
+    if not ADMIN_ID:
+        return
+    _ensure_dirs()
+    cookie_files = sorted(IG_USER_COOKIES_DIR.glob("user_*.txt"))
+    if not cookie_files:
+        return
+
+    expired = []
+    for cf in cookie_files:
+        ok, status = _check_ig_cookie_file(str(cf))
+        if not ok:
+            expired.append(f"❌ {cf.name} — {status}")
+
+    if not expired:
+        return  # All good, no need to bother admin
+
+    lines = "\n".join(expired)
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⚠️ <b>Проверка cookies Instagram</b>\n\nПросроченные куки:\n{lines}\n\nОбнови через /pechenyuha.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning("Не удалось отправить предупреждение об истечении cookies: %s", e)
+
+
 async def pechenyuha_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -4110,6 +4252,7 @@ def build_application() -> Application:
 
     app.add_handler(CommandHandler("pechenyuha", pechenyuha_command))
     app.add_handler(CommandHandler("users", get_users_count))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CallbackQueryHandler(broadcast_callback, pattern=r"^bcast:"))
     app.add_handler(CommandHandler("start", start_command))
@@ -4127,6 +4270,12 @@ def build_application() -> Application:
     # Cache cleanup job
     if app.job_queue:
         app.job_queue.run_repeating(clean_cache_job, interval=CACHE_CLEAN_INTERVAL_SECONDS, first=10)
+        # Daily cookie health check at 07:00 UTC
+        import datetime as _dt
+        app.job_queue.run_daily(
+            cookie_health_check_job,
+            time=_dt.time(hour=7, minute=0, tzinfo=_dt.timezone.utc),
+        )
 
     return app
 
