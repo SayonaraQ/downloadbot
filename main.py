@@ -2506,71 +2506,53 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     page, _, _ = _session_page(session)
     try:
-        candidate = page[int(idx_str)]
+        page_idx = int(idx_str)
+        candidate = page[page_idx]
     except (ValueError, IndexError):
         await cq.edit_message_text("Неверный выбор.")
         return
 
-    url = candidate["url"]
+    # Absolute index of selected candidate in the full list
+    all_candidates: list[dict] = session.get("all", [])
+    abs_idx = session.get("offset", 0) + page_idx
+
     title = candidate["title"]
     chat_id = cq.message.chat_id
     requester_id = cq.from_user.id if cq.from_user else None
 
-    # Cancel auto-delete immediately so it doesn't fire during download
+    # Pop session — cancel auto-delete timer
     popped = _music_search_sessions.pop(session_id, None)
     if popped:
         task = popped.get("delete_task")
         if task and not task.done():
             task.cancel()
 
-    channel = candidate.get("channel", "")
-    source = candidate.get("source", "")
-    search_query = f"{channel} - {title}" if channel else title
     await cq.edit_message_text(f"Скачиваю: {title}…")
 
     async with sema:
         entry = None
+        # Try selected candidate first, then remaining ones from the same search results
+        candidates_queue = all_candidates[abs_idx:]
 
-        # Attempt 1 — original URL
-        try:
-            entry = await _get_or_download_audio_entry(url, requester_id=requester_id)
-        except Exception as e:
-            if not _is_track_unavailable(str(e)):
-                logger.error("Ошибка при загрузке трека: %s", e)
-                await cq.edit_message_text(f"Не удалось загрузить «{title}».")
-                return
-            logger.warning("Track unavailable (%s), trying fallbacks for: %s", source, search_query)
-
-        # Attempt 2 — YouTube search (skip if original was YouTube)
-        if entry is None and source != "yt":
+        for cand in candidates_queue:
+            cand_title = cand.get("title", "?")
             try:
-                await cq.edit_message_text(f"Ищу на YouTube: {title}…")
-                yt_hits = await asyncio.to_thread(
-                    _search_music_candidates, search_query, 1, "ytsearch"
+                if cand is not candidate:
+                    await cq.edit_message_text(f"Пробую следующий вариант: {cand_title}…")
+                entry = await _get_or_download_audio_entry(
+                    cand["url"], requester_id=requester_id
                 )
-                if yt_hits:
-                    entry = await _get_or_download_audio_entry(
-                        yt_hits[0]["url"], requester_id=requester_id
-                    )
+                break
             except Exception as e:
-                logger.warning("YouTube fallback failed: %s", e)
+                if not _is_track_unavailable(str(e)):
+                    logger.error("Ошибка загрузки трека: %s", e)
+                    await cq.edit_message_text(f"Не удалось загрузить «{cand_title}».")
+                    return
+                logger.warning("Track unavailable, skipping: %s", cand.get("url", ""))
 
-        # Attempt 3 — SoundCloud search (skip if original was SoundCloud)
-        if entry is None and source != "sc":
-            try:
-                await cq.edit_message_text(f"Ищу на SoundCloud: {title}…")
-                sc_hits = await asyncio.to_thread(
-                    _search_music_candidates, search_query, 1, "scsearch"
-                )
-                if sc_hits:
-                    entry = await _get_or_download_audio_entry(
-                        sc_hits[0]["url"], requester_id=requester_id
-                    )
-            except Exception as e:
-                logger.warning("SoundCloud fallback failed: %s", e)
-
-        # Attempt 4 — Yandex Music search
+        # If all candidates in the list failed — try Yandex Music as last resort
         if entry is None and YA_TOKEN:
+            search_query = f"{candidate.get('channel', '')} - {title}".strip(" -")
             try:
                 await cq.edit_message_text(f"Ищу на Яндекс.Музыке: {title}…")
                 ym_url = await asyncio.to_thread(_search_yandex_music_url, search_query)
@@ -2580,7 +2562,7 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.warning("Yandex Music fallback failed: %s", e)
 
         if entry is None:
-            await cq.edit_message_text(f"Трек «{title}» недоступен ни на одной платформе.")
+            await cq.edit_message_text(f"Трек «{title}» нигде не удалось найти.")
             return
 
     key = str(entry["key"])
