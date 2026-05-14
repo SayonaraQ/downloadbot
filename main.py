@@ -2059,17 +2059,11 @@ async def _get_or_download_audio_entry(
 # Telegram handlers
 # -------------------------
 
-# SoundCloud global charts URLs — без параметра genre, чтобы yt-dlp получал
-# полный список из 50 треков; фильтрация нелатинских скриптов делается в Python
-_SC_CHART_URLS: dict[str, str] = {
-    "top": "https://soundcloud.com/charts/top",
-    "new": "https://soundcloud.com/charts/new",
-}
-# Fallback search queries if chart URL fails
-_SC_PRESET_QUERIES: dict[str, str] = {
-    "top": "top pop hits 2025 official",
-    "new": "new pop music 2025 official",
-}
+# "Топ хиты" — Яндекс.Музыка world chart (используем уже существующий YA_TOKEN)
+# "Новинки" — кураторский SoundCloud плейлист
+_SC_NEW_PLAYLIST_URL = "https://soundcloud.com/trending-music-eunon/sets/soundcloud"
+# Fallback search query for "Новинки" if playlist fetch fails
+_SC_NEW_FALLBACK_QUERY = "new pop music 2025 official"
 
 # Unicode codepoint ranges for non-Latin writing systems to exclude from charts
 _NON_LATIN_SCRIPT_RANGES = (
@@ -2098,6 +2092,48 @@ def _has_non_latin_script(text: str) -> bool:
             if lo <= cp <= hi:
                 return True
     return False
+
+
+def _fetch_yandex_chart(n: int) -> list[dict[str, Any]]:
+    """Fetch world chart tracks from Yandex Music API."""
+    if not YA_TOKEN:
+        return []
+    try:
+        from yandex_music import Client as _YMClient
+        from yandex_music.utils.request import Request as _YMRequest
+    except ImportError:
+        return []
+    try:
+        proxy = YA_PROXY or RU_PROXY
+        request = _YMRequest(proxy_url=proxy) if proxy else None
+        client = _YMClient(YA_TOKEN, request=request).init()
+        chart_info = client.chart("world")
+        if not chart_info or not chart_info.chart:
+            return []
+        results = []
+        for track_short in (chart_info.chart.tracks or [])[:n]:
+            track = track_short.track
+            if not track:
+                continue
+            albums = track.albums or []
+            if not albums:
+                continue
+            album_id = albums[0].id
+            track_url = f"https://music.yandex.ru/album/{album_id}/track/{track.id}"
+            artists = ", ".join(a.name for a in (track.artists or []))
+            title = f"{artists} — {track.title}" if artists else (track.title or "Без названия")
+            dur_sec = (track.duration_ms or 0) / 1000
+            results.append({
+                "url": track_url,
+                "title": title,
+                "channel": artists,
+                "duration": dur_sec,
+                "source": "yandex_music",
+            })
+        return results
+    except Exception as e:
+        logger.warning("Yandex Music chart failed: %s", e)
+        return []
 
 
 def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
@@ -2584,26 +2620,34 @@ async def sc_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     pool = MUSIC_SEARCH_RESULTS * _MUSIC_MAX_PAGES
     await cq.edit_message_text(f"Ищу {label}…")
 
-    # Try official SoundCloud global charts first; fall back to search query
-    chart_url = _SC_CHART_URLS.get(kind, "")
     candidates: list[dict[str, Any]] = []
-    if chart_url:
-        candidates = await asyncio.to_thread(_fetch_sc_chart_url, chart_url, pool)
+
+    if kind == "top":
+        # Яндекс.Музыка world chart
+        candidates = await asyncio.to_thread(_fetch_yandex_chart, pool)
         if candidates:
-            logger.info("Chart '%s': got %d tracks from chart URL", kind, len(candidates))
-    if not candidates:
-        query = _SC_PRESET_QUERIES[kind]
-        logger.info("Chart '%s': chart URL empty, falling back to search '%s'", kind, query)
-        try:
-            raw = await asyncio.to_thread(_search_music_candidates, query, pool, "scsearch")
-            candidates = [
-                {**c, "source": "sc"}
-                for c in raw
-                if not _has_non_latin_script(c.get("title", ""))
-            ]
-        except Exception as e:
-            logger.warning("Preset search '%s' failed: %s", query, e)
-            candidates = []
+            logger.info("Chart 'top': got %d tracks from Yandex Music world chart", len(candidates))
+        else:
+            logger.warning("Chart 'top': Yandex Music chart returned nothing (YA_TOKEN set: %s)", bool(YA_TOKEN))
+
+    else:  # "new"
+        # Кураторский SoundCloud плейлист
+        candidates = await asyncio.to_thread(_fetch_sc_chart_url, _SC_NEW_PLAYLIST_URL, pool)
+        if candidates:
+            logger.info("Chart 'new': got %d tracks from SC playlist", len(candidates))
+        else:
+            # Fallback to search
+            logger.info("Chart 'new': playlist empty, falling back to search")
+            try:
+                raw = await asyncio.to_thread(_search_music_candidates, _SC_NEW_FALLBACK_QUERY, pool, "scsearch")
+                candidates = [
+                    {**c, "source": "sc"}
+                    for c in raw
+                    if not _has_non_latin_script(c.get("title", ""))
+                ]
+            except Exception as e:
+                logger.warning("Chart 'new' fallback search failed: %s", e)
+
     if not candidates:
         await cq.edit_message_text("Ничего не найдено.")
         return
