@@ -2545,9 +2545,13 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if entry is None and source != "yt":
             try:
                 await cq.edit_message_text(f"Ищу на YouTube: {title}…")
-                entry = await _get_or_download_audio_entry(
-                    f"ytsearch1:{search_query}", requester_id=requester_id
+                yt_hits = await asyncio.to_thread(
+                    _search_music_candidates, search_query, 1, "ytsearch"
                 )
+                if yt_hits:
+                    entry = await _get_or_download_audio_entry(
+                        yt_hits[0]["url"], requester_id=requester_id
+                    )
             except Exception as e:
                 logger.warning("YouTube fallback failed: %s", e)
 
@@ -2555,9 +2559,13 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if entry is None and source != "sc":
             try:
                 await cq.edit_message_text(f"Ищу на SoundCloud: {title}…")
-                entry = await _get_or_download_audio_entry(
-                    f"scsearch1:{search_query}", requester_id=requester_id
+                sc_hits = await asyncio.to_thread(
+                    _search_music_candidates, search_query, 1, "scsearch"
                 )
+                if sc_hits:
+                    entry = await _get_or_download_audio_entry(
+                        sc_hits[0]["url"], requester_id=requester_id
+                    )
             except Exception as e:
                 logger.warning("SoundCloud fallback failed: %s", e)
 
