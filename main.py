@@ -2216,9 +2216,7 @@ def _search_music_candidates(query: str, n: int, prefix: str = "ytsearch") -> li
         if not isinstance(e, dict):
             continue
         dur = e.get("duration")
-        if dur and dur > MAX_DURATION_SEC:
-            continue
-        if dur and dur < MIN_DURATION_SEC:
+        if not dur or dur > MAX_DURATION_SEC or dur < MIN_DURATION_SEC:
             continue
         vid_id = e.get("id") or ""
         url = e.get("webpage_url") or e.get("url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None)
@@ -2508,9 +2506,12 @@ async def sc_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     label = "🔥 Топ хиты" if kind == "top" else "✨ Новинки"
     query = _SC_PRESET_QUERIES[kind]
+    pool = MUSIC_SEARCH_RESULTS * _MUSIC_MAX_PAGES
     await cq.edit_message_text(f"Ищу {label}…")
     try:
-        candidates = await _search_music_multi_async(query, MUSIC_SEARCH_RESULTS)
+        # SoundCloud only — YouTube returns compilations for these queries
+        candidates = await asyncio.to_thread(_search_music_candidates, query, pool, "scsearch")
+        candidates = [{**c, "source": "sc"} for c in candidates]
     except Exception as e:
         logger.warning("Preset search '%s' failed: %s", query, e)
         candidates = []
