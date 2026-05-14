@@ -2059,17 +2059,45 @@ async def _get_or_download_audio_entry(
 # Telegram handlers
 # -------------------------
 
-# SoundCloud global charts URLs — genre=soundcloud:genres:pop фильтрует в сторону
-# западного попа и убирает арабскую/индийскую музыку с глобальных чартов
+# SoundCloud global charts URLs — без параметра genre, чтобы yt-dlp получал
+# полный список из 50 треков; фильтрация нелатинских скриптов делается в Python
 _SC_CHART_URLS: dict[str, str] = {
-    "top": "https://soundcloud.com/charts/top?genre=soundcloud:genres:pop",
-    "new": "https://soundcloud.com/charts/new?genre=soundcloud:genres:pop",
+    "top": "https://soundcloud.com/charts/top",
+    "new": "https://soundcloud.com/charts/new",
 }
 # Fallback search queries if chart URL fails
 _SC_PRESET_QUERIES: dict[str, str] = {
     "top": "top pop hits 2025 official",
     "new": "new pop music 2025 official",
 }
+
+# Unicode codepoint ranges for non-Latin writing systems to exclude from charts
+_NON_LATIN_SCRIPT_RANGES = (
+    (0x0600, 0x06FF),  # Arabic
+    (0x0750, 0x077F),  # Arabic Supplement
+    (0x08A0, 0x08FF),  # Arabic Extended-A
+    (0xFB50, 0xFDFF),  # Arabic Presentation Forms
+    (0x0900, 0x097F),  # Devanagari (Hindi, Marathi…)
+    (0x0980, 0x09FF),  # Bengali
+    (0x0A00, 0x0A7F),  # Gurmukhi
+    (0x0B80, 0x0BFF),  # Tamil
+    (0x0C00, 0x0C7F),  # Telugu
+    (0x0C80, 0x0CFF),  # Kannada
+    (0x0D00, 0x0D7F),  # Malayalam
+    (0x0E00, 0x0E7F),  # Thai
+    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
+    (0x3040, 0x30FF),  # Hiragana / Katakana
+    (0xAC00, 0xD7AF),  # Hangul syllables
+)
+
+
+def _has_non_latin_script(text: str) -> bool:
+    for ch in text:
+        cp = ord(ch)
+        for lo, hi in _NON_LATIN_SCRIPT_RANGES:
+            if lo <= cp <= hi:
+                return True
+    return False
 
 
 def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
@@ -2099,9 +2127,12 @@ def _fetch_sc_chart_url(url: str, n: int) -> list[dict[str, Any]]:
         track_url = e.get("webpage_url") or e.get("url")
         if not track_url:
             continue
+        title = e.get("title") or "Без названия"
+        if _has_non_latin_script(title):
+            continue
         results.append({
             "url": track_url,
-            "title": e.get("title") or "Без названия",
+            "title": title,
             "channel": e.get("channel") or e.get("uploader") or "",
             "duration": dur or 0,
             "source": "sc",
@@ -2564,8 +2595,12 @@ async def sc_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         query = _SC_PRESET_QUERIES[kind]
         logger.info("Chart '%s': chart URL empty, falling back to search '%s'", kind, query)
         try:
-            candidates = await asyncio.to_thread(_search_music_candidates, query, pool, "scsearch")
-            candidates = [{**c, "source": "sc"} for c in candidates]
+            raw = await asyncio.to_thread(_search_music_candidates, query, pool, "scsearch")
+            candidates = [
+                {**c, "source": "sc"}
+                for c in raw
+                if not _has_non_latin_script(c.get("title", ""))
+            ]
         except Exception as e:
             logger.warning("Preset search '%s' failed: %s", query, e)
             candidates = []
