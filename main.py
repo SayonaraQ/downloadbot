@@ -3328,7 +3328,7 @@ async def _prepare_inline_cache_task(
             _clear_inline_prepare_failure(task_key)
             return entry
     except UserFacingDownloadError as e:
-        _record_inline_prepare_failure(task_key, "Не получилось", str(e))
+        _record_inline_prepare_failure(task_key, "Посты не поддерживаются", str(e))
         logger.warning("inline-кэш (%s) — пользовательская ошибка: %s", kind, e)
         return None
     except Exception as e:
