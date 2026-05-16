@@ -230,6 +230,11 @@ _last_success_cookie_lock = threading.Lock()
 # are prepared in the background and served from Telegram file_id on the next query.
 _inline_prepare_tasks: dict[str, asyncio.Task] = {}
 
+# Sticky user-facing failures from background inline-prepare tasks. Lets the next
+# inline/guest query surface a clear message instead of looping "Готовлю медиа".
+_inline_prepare_failures: dict[str, dict[str, Any]] = {}
+_INLINE_FAILURE_TTL_SEC = 300
+
 # Pending /music search sessions: session_id -> {all, offset, page_size}
 _music_search_sessions: dict[str, dict[str, Any]] = {}
 _MUSIC_MAX_PAGES = max(1, int(os.getenv("MUSIC_MAX_PAGES", "3")))
@@ -3279,6 +3284,28 @@ def _first_guest_result_from_entry(entry: dict[str, Any]) -> dict[str, Any] | No
     return _inline_result_to_payload(results[0])
 
 
+def _record_inline_prepare_failure(task_key: str, title: str, message: str) -> None:
+    _inline_prepare_failures[task_key] = {
+        "title": title,
+        "message": message,
+        "expires_at": _now() + _INLINE_FAILURE_TTL_SEC,
+    }
+
+
+def _get_inline_prepare_failure(task_key: str) -> dict[str, Any] | None:
+    info = _inline_prepare_failures.get(task_key)
+    if not info:
+        return None
+    if info.get("expires_at", 0) < _now():
+        _inline_prepare_failures.pop(task_key, None)
+        return None
+    return info
+
+
+def _clear_inline_prepare_failure(task_key: str) -> None:
+    _inline_prepare_failures.pop(task_key, None)
+
+
 async def _prepare_inline_cache_task(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -3298,7 +3325,12 @@ async def _prepare_inline_cache_task(
             else:
                 entry = await _get_or_download_media_entry(source, requester_id=requester_id)
             await _ensure_inline_file_ids(context, entry=entry, upload_chat_id=upload_chat_id)
+            _clear_inline_prepare_failure(task_key)
             return entry
+    except UserFacingDownloadError as e:
+        _record_inline_prepare_failure(task_key, "Не получилось", str(e))
+        logger.warning("inline-кэш (%s) — пользовательская ошибка: %s", kind, e)
+        return None
     except Exception as e:
         logger.warning("Не удалось подготовить inline-кэш (%s): %s", kind, e)
         return None
@@ -3475,6 +3507,14 @@ async def _answer_guest_from_entry_or_prepare(
             await _answer_guest_query(guest_query_id, result)
             return
 
+    failure = _get_inline_prepare_failure(_inline_prepare_task_key(kind, source))
+    if failure:
+        await _answer_guest_query(
+            guest_query_id,
+            _guest_article_result(failure["title"], failure["message"]),
+        )
+        return
+
     if not INLINE_CACHE_CHAT_ID:
         await _answer_guest_query(
             guest_query_id,
@@ -3595,6 +3635,15 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await inline_query.answer(results[:50], cache_time=0, is_personal=True)
                 return
 
+            failure = _get_inline_prepare_failure(_inline_prepare_task_key("audio", music_source))
+            if failure:
+                await inline_query.answer(
+                    [_inline_article(failure["title"], failure["message"])],
+                    cache_time=10,
+                    is_personal=True,
+                )
+                return
+
             if not upload_chat_id:
                 await inline_query.answer(
                     [_inline_article(
@@ -3624,6 +3673,15 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await inline_query.answer(results[:50], cache_time=0, is_personal=True)
                 return
 
+            failure = _get_inline_prepare_failure(_inline_prepare_task_key("audio", music_source))
+            if failure:
+                await inline_query.answer(
+                    [_inline_article(failure["title"], failure["message"])],
+                    cache_time=10,
+                    is_personal=True,
+                )
+                return
+
             title = "Уже готовлю аудио" if already_running else "Готовлю аудио"
             await inline_query.answer(
                 [_inline_article(
@@ -3650,6 +3708,15 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not results:
                 results = [_inline_article("Не удалось подготовить медиа", "Попробуй отправить ссылку боту напрямую.")]
             await inline_query.answer(results[:50], cache_time=0, is_personal=True)
+            return
+
+        failure = _get_inline_prepare_failure(_inline_prepare_task_key("media", video_url))
+        if failure:
+            await inline_query.answer(
+                [_inline_article(failure["title"], failure["message"])],
+                cache_time=10,
+                is_personal=True,
+            )
             return
 
         if not upload_chat_id:
@@ -3681,6 +3748,15 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             if not results:
                 results = [_inline_article("Не удалось подготовить медиа", "Попробуй отправить ссылку боту напрямую.")]
             await inline_query.answer(results[:50], cache_time=0, is_personal=True)
+            return
+
+        failure = _get_inline_prepare_failure(_inline_prepare_task_key("media", video_url))
+        if failure:
+            await inline_query.answer(
+                [_inline_article(failure["title"], failure["message"])],
+                cache_time=10,
+                is_personal=True,
+            )
             return
 
         title = "Уже готовлю медиа" if already_running else "Готовлю медиа"
