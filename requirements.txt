@@ -1,6 +1,6 @@
-python-telegram-bot[job-queue]>=22.7
+python-telegram-bot[job-queue]==22.7
 yt-dlp
-python-dotenv
-requests[socks]
-yandex-music
-soundcloud-v2
+python-dotenv==1.0.1
+requests[socks]==2.32.3
+yandex-music==3.0.0
+soundcloud-v2==1.7.0

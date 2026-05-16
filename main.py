@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -15,7 +16,27 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
+
+
+def _make_http_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
+    sess = requests.Session()
+    retry = Retry(
+        total=retries,
+        backoff_factor=backoff,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST", "HEAD"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    return sess
+
+
+_TG_HTTP_SESSION = _make_http_session()
 from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
@@ -32,8 +53,10 @@ from telegram import (
     InlineQueryResultCachedDocument,
     InlineQueryResultCachedPhoto,
     InlineQueryResultCachedVideo,
+    LinkPreviewOptions,
     Update,
 )
+from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -58,7 +81,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+for _noisy in ("httpx", "httpcore", "telegram.ext", "telegram.bot", "telegram.network", "yt_dlp", "urllib3", "asyncio"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 class UserFacingDownloadError(ValueError):
@@ -239,6 +263,16 @@ _INLINE_FAILURE_TTL_SEC = 300
 _music_search_sessions: dict[str, dict[str, Any]] = {}
 _MUSIC_MAX_PAGES = max(1, int(os.getenv("MUSIC_MAX_PAGES", "3")))
 
+# Strong refs to background tasks — prevents GC from collecting them mid-await
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_bg_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
 
 def _session_page(session: dict[str, Any]) -> tuple[list[dict[str, Any]], bool, bool]:
     all_c = session["all"]
@@ -287,22 +321,38 @@ def _ensure_dirs() -> None:
     IG_USER_COOKIES_DIR.mkdir(parents=True, exist_ok=True)
 
 
+YTDLP_UPDATE_INTERVAL_SEC = int(os.getenv("YTDLP_UPDATE_INTERVAL_SEC", str(6 * 3600)))
+
+
 def auto_update_ytdlp() -> None:
-    """Optional: update yt-dlp on startup."""
+    """Update yt-dlp via pip. Called at startup and periodically."""
     try:
         logger.info("Проверяю обновления yt-dlp…")
-        subprocess.run(
-            [os.sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            text=True,
+            timeout=300,
         )
+        out = (result.stdout or "") + (result.stderr or "")
+        if "Successfully installed" in out:
+            logger.info("yt-dlp обновлён")
+        elif "Requirement already satisfied" in out or "up-to-date" in out.lower():
+            logger.info("yt-dlp уже актуален")
+        else:
+            logger.warning("yt-dlp update unclear: rc=%d", result.returncode)
         ffmpeg_path = shutil.which("ffmpeg")
         ffprobe_path = shutil.which("ffprobe")
         if ffmpeg_path is None or ffprobe_path is None:
             logger.warning("ffmpeg/ffprobe не найдены в PATH — конвертация и проверка кодеков могут не работать")
     except Exception as e:
         logger.warning(f"Не удалось обновить yt-dlp автоматически: {e}")
+
+
+async def ytdlp_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await asyncio.to_thread(auto_update_ytdlp)
 
 
 def save_user(chat_id: int) -> None:
@@ -372,6 +422,7 @@ def _list_uploaded_ig_cookie_files(preferred_user_id: int | None = None) -> list
 def _validate_instagram_cookie_text(cookie_text: str) -> tuple[bool, str | None]:
     has_netscape_rows = False
     has_instagram_domain = False
+    parse_errors = 0
 
     for raw_line in cookie_text.splitlines():
         line = raw_line.strip()
@@ -382,8 +433,13 @@ def _validate_instagram_cookie_text(cookie_text: str) -> tuple[bool, str | None]
         elif line.startswith("#"):
             continue
 
-        parts = line.split("\t")
+        try:
+            parts = line.split("\t")
+        except Exception:
+            parse_errors += 1
+            continue
         if len(parts) < 7:
+            parse_errors += 1
             continue
 
         has_netscape_rows = True
@@ -392,6 +448,8 @@ def _validate_instagram_cookie_text(cookie_text: str) -> tuple[bool, str | None]
             has_instagram_domain = True
             break
 
+    if parse_errors:
+        logger.info("IG cookie validation: %d не-Netscape строк пропущены", parse_errors)
     if not has_netscape_rows:
         return False, "Файл не похож на Netscape cookies.txt (ожидаются строки с tab-разделителями)."
     if not has_instagram_domain:
@@ -482,8 +540,29 @@ def _video_format_fallback_for_site(site: str) -> str:
     return VIDEO_FORMAT_FALLBACK
 
 
+_TRACKING_PARAM_PREFIXES = ("utm_", "fbclid", "gclid", "ref", "src", "from", "share", "_branch_match_id", "si", "_r")
+
+
+def _canonicalize_url_for_cache(url: str) -> str:
+    """Strip tracking params so the same media gives the same cache key."""
+    try:
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+        parts = urlsplit(url.strip())
+        if not parts.scheme:
+            return url.strip()
+        kept = [
+            (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if not any(k.lower() == p or k.lower().startswith(p) for p in _TRACKING_PARAM_PREFIXES)
+        ]
+        netloc = parts.netloc.lower()
+        path = parts.path.rstrip("/") or parts.path
+        return urlunsplit((parts.scheme.lower(), netloc, path, urlencode(kept), ""))
+    except Exception:
+        return url.strip()
+
+
 def _cache_key(url: str) -> str:
-    return hashlib.sha256(url.strip().encode("utf-8")).hexdigest()
+    return hashlib.sha256(_canonicalize_url_for_cache(url).encode("utf-8")).hexdigest()
 
 
 def _cache_dir_for_key(key: str) -> Path:
@@ -532,6 +611,7 @@ def _purge_cache_entry(key: str) -> None:
     """Remove cache entry (meta + files)."""
     try:
         _cache_index.pop(key, None)
+        _cache_locks.pop(key, None)
         d = _cache_dir_for_key(key)
         if d.exists() and d.is_dir():
             shutil.rmtree(d, ignore_errors=True)
@@ -602,17 +682,13 @@ def cleanup_cache() -> int:
 
 
 async def clean_cache_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    deleted = cleanup_cache()
+    deleted = await asyncio.to_thread(cleanup_cache)
     if deleted:
         logger.info(f"Кэш: удалено {deleted} просроченных записей")
 
 
 def _get_or_create_lock(key: str) -> asyncio.Lock:
-    lock = _cache_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _cache_locks[key] = lock
-    return lock
+    return _cache_locks.setdefault(key, asyncio.Lock())
 
 
 def _cache_entry_is_usable(entry: dict[str, Any]) -> bool:
@@ -702,31 +778,54 @@ def _classify_file(path: Path) -> str:
     return "document"
 
 
+_probe_cache: dict[tuple[str, int, int], dict[str, Any]] = {}
+_PROBE_CACHE_MAX = 512
+
+
 def _probe_media(path: Path) -> dict[str, Any] | None:
     ffprobe_path = shutil.which("ffprobe")
     if ffprobe_path is None:
         return None
 
-    result = subprocess.run(
-        [
-            ffprobe_path,
-            "-v",
-            "error",
-            "-show_streams",
-            "-show_format",
-            "-of",
-            "json",
-            str(path),
-        ],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    try:
+        st = path.stat()
+        cache_key = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        cache_key = None
+    if cache_key is not None:
+        cached = _probe_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    try:
+        result = subprocess.run(
+            [
+                ffprobe_path,
+                "-v",
+                "error",
+                "-show_streams",
+                "-show_format",
+                "-of",
+                "json",
+                str(path),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"ffprobe завис на {path.name} (>30s)") from e
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"ffprobe завершился с кодом {result.returncode}")
 
-    return json.loads(result.stdout or "{}")
+    probe = json.loads(result.stdout or "{}")
+    if cache_key is not None and isinstance(probe, dict):
+        if len(_probe_cache) >= _PROBE_CACHE_MAX:
+            _probe_cache.pop(next(iter(_probe_cache)))
+        _probe_cache[cache_key] = probe
+    return probe
 
 
 def _collect_downloaded_files(workdir: Path) -> list[Path]:
@@ -983,23 +1082,30 @@ def _normalize_video_for_ios(path: Path) -> Path:
             IOS_TRANSCODE_MAX_PARALLEL,
         )
 
-    if needs_video_transcode:
-        with ios_transcode_sema:
+    ffmpeg_timeout = 600
+    try:
+        if needs_video_transcode:
+            with ios_transcode_sema:
+                result = subprocess.run(
+                    cmd,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=ffmpeg_timeout,
+                )
+        else:
             result = subprocess.run(
                 cmd,
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                timeout=ffmpeg_timeout,
             )
-    else:
-        result = subprocess.run(
-            cmd,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+    except subprocess.TimeoutExpired as e:
+        target.unlink(missing_ok=True)
+        raise RuntimeError(f"ffmpeg завис на {path.name} (>{ffmpeg_timeout}s)") from e
     if result.returncode != 0:
         target.unlink(missing_ok=True)
         raise RuntimeError(result.stderr.strip() or f"ffmpeg завершился с кодом {result.returncode}")
@@ -1599,7 +1705,7 @@ def _normalize_yandex_music_url(url: str, *, cookiefile: str | None, proxy: str 
         return url
 
     try:
-        sess = requests.Session()
+        sess = _make_http_session(retries=2, backoff=0.3)
         headers = {
             "User-Agent": "Mozilla/5.0",
             "Referer": "https://music.yandex.ru/",
@@ -1613,7 +1719,11 @@ def _normalize_yandex_music_url(url: str, *, cookiefile: str | None, proxy: str 
             cj.load(cookiefile, ignore_expires=True, ignore_discard=True)
             sess.cookies = cj
 
-        html = sess.get(url, headers=headers, proxies=proxies, timeout=15).text
+        resp = sess.get(url, headers=headers, proxies=proxies, timeout=15)
+        if resp.status_code >= 400:
+            logger.warning("Yandex Music normalize HTTP %d for %s", resp.status_code, url)
+            return url
+        html = resp.text
         patterns = [
             r'<meta[^>]+property=["\']og:url["\'][^>]+content=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
             r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\'](https://music\.yandex\.(?:ru|by|kz|ua)/album/\d+/track/\d+)',
@@ -2286,6 +2396,16 @@ def _collect_cache_stats() -> dict[str, Any]:
     audio_count = 0
     video_count = 0
     by_site: dict[str, int] = {}
+    size_bytes = 0
+    try:
+        for f in CACHE_DIR.rglob("*"):
+            if f.is_file():
+                try:
+                    size_bytes += f.stat().st_size
+                except OSError:
+                    pass
+    except Exception:
+        pass
     for entry in list(_cache_index.values()):
         if _is_entry_expired(entry):
             continue
@@ -2297,21 +2417,12 @@ def _collect_cache_stats() -> dict[str, Any]:
         else:
             video_count += 1
         by_site[site] = by_site.get(site, 0) + 1
-    return {"audio": audio_count, "video": video_count, "by_site": by_site}
-
-
-def _cache_dir_size_mb() -> float:
-    total = 0
-    try:
-        for p in CACHE_DIR.rglob("*"):
-            if p.is_file():
-                try:
-                    total += p.stat().st_size
-                except OSError:
-                    pass
-    except Exception:
-        pass
-    return total / (1024 * 1024)
+    return {
+        "audio": audio_count,
+        "video": video_count,
+        "by_site": by_site,
+        "size_mb": size_bytes / (1024 * 1024),
+    }
 
 
 def _check_ig_cookie_file(cookiefile: str) -> tuple[bool, str]:
@@ -2348,7 +2459,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # Cache
     stats = _collect_cache_stats()
     total_entries = stats["audio"] + stats["video"]
-    size_mb = _cache_dir_size_mb()
+    size_mb = stats["size_mb"]
     size_str = f"{size_mb / 1024:.1f} GB" if size_mb >= 1024 else f"{size_mb:.0f} MB"
 
     by_site_lines = ""
@@ -2531,7 +2642,8 @@ def _search_music_candidates(query: str, n: int, prefix: str = "ytsearch") -> li
         if not isinstance(e, dict):
             continue
         dur = e.get("duration")
-        if not dur or dur > MAX_DURATION_SEC or dur < MIN_DURATION_SEC:
+        # SoundCloud flat extraction может не отдавать duration — пропускаем фильтр в этом случае
+        if dur is not None and (dur > MAX_DURATION_SEC or dur < MIN_DURATION_SEC):
             continue
         vid_id = e.get("id") or ""
         url = e.get("webpage_url") or e.get("url") or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else None)
@@ -2748,7 +2860,7 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 msg = await context.bot.send_audio(chat_id=chat_id, audio=f, **audio_kwargs)
             it["tg_file_id"] = msg.audio.file_id
         if ad and not caption_scheduled:
-            asyncio.create_task(_remove_caption_after(context.bot, chat_id, msg.message_id, AD_TRACK_DELAY_SEC))
+            _spawn_bg_task(_remove_caption_after(context.bot, chat_id, msg.message_id, AD_TRACK_DELAY_SEC))
             caption_scheduled = True
 
     _write_cache_entry(entry)
@@ -2950,7 +3062,7 @@ async def ytmusic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ad = _build_ad_caption()
             msg_id = await send_cache_entry(update, context, entry, audio_caption=ad[0] if ad else None)
             if msg_id and ad:
-                asyncio.create_task(_remove_caption_after(
+                _spawn_bg_task(_remove_caption_after(
                     context.bot, update.message.chat_id, msg_id, AD_TRACK_DELAY_SEC,
                 ))
         except ValueError as e:
@@ -3053,9 +3165,7 @@ async def _get_or_download_media_entry(
         if entry and _cache_entry_is_usable(entry):
             return entry
 
-        tmp_dir = Path("/tmp") / f"dl_{key[:12]}"
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+        tmp_dir = Path("/tmp") / f"dl_{key[:12]}_{uuid.uuid4().hex[:8]}"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -3260,7 +3370,7 @@ async def _answer_guest_query(guest_query_id: str, result: Any) -> None:
     }
 
     def _post() -> None:
-        response = requests.post(
+        response = _TG_HTTP_SESSION.post(
             f"https://api.telegram.org/bot{TOKEN}/answerGuestQuery",
             json=payload,
             timeout=20,
@@ -3871,12 +3981,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     save_user(chat_id)
 
-    # Cleanup cache opportunistically (cheap)
-    try:
-        cleanup_cache()
-    except Exception:
-        pass
-
     # 4) In private chats: any non-URL text → music search (outside sema — no download)
     if update.message.chat.type == "private" and not _looks_like_url(text) and not _extract_inline_music_source(text):
         status_msg = await update.message.reply_text("Ищу…")
@@ -3922,7 +4026,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     video_caption=AD_VIDEO_TEXT or None,
                 )
                 if msg_id and vid_ad:
-                    asyncio.create_task(_remove_caption_after(
+                    _spawn_bg_task(_remove_caption_after(
                         context.bot, update.message.chat_id, msg_id, AD_VIDEO_DELAY_SEC,
                     ))
             except ValueError as e:
@@ -4185,17 +4289,34 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         failed = 0
         total = len(recipients)
         for i, uid in enumerate(recipients):
-            try:
-                await context.bot.send_message(
-                    chat_id=uid,
-                    text=bcast_text,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-                sent += 1
-            except Exception as e:
-                logger.warning("Broadcast: не удалось отправить %d: %s", uid, e)
-                failed += 1
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text=bcast_text,
+                        parse_mode="HTML",
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    )
+                    sent += 1
+                    break
+                except RetryAfter as e:
+                    wait_sec = float(getattr(e, "retry_after", 0) or 1.0) + 0.5
+                    if attempt > 3 or wait_sec > 60:
+                        logger.warning("Broadcast: %d RetryAfter %.1fs — drop", uid, wait_sec)
+                        failed += 1
+                        break
+                    logger.info("Broadcast: 429 — sleep %.1fs (attempt %d)", wait_sec, attempt)
+                    await asyncio.sleep(wait_sec)
+                except (Forbidden, BadRequest) as e:
+                    logger.warning("Broadcast: %d permanent: %s", uid, e)
+                    failed += 1
+                    break
+                except Exception as e:
+                    logger.warning("Broadcast: не удалось отправить %d: %s", uid, e)
+                    failed += 1
+                    break
             # Update progress every 10 messages
             if (i + 1) % 10 == 0 or (i + 1) == total:
                 try:
@@ -4351,6 +4472,12 @@ def build_application() -> Application:
         app.job_queue.run_daily(
             cookie_health_check_job,
             time=_dt.time(hour=7, minute=0, tzinfo=_dt.timezone.utc),
+        )
+        # Periodic yt-dlp self-update (sites break when extractor stale)
+        app.job_queue.run_repeating(
+            ytdlp_update_job,
+            interval=YTDLP_UPDATE_INTERVAL_SEC,
+            first=YTDLP_UPDATE_INTERVAL_SEC,
         )
 
     return app
