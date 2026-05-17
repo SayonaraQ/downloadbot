@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -63,6 +64,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    Defaults,
     InlineQueryHandler,
     MessageHandler,
     TypeHandler,
@@ -70,6 +72,13 @@ from telegram.ext import (
 )
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
+
+try:
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+    _HAS_IMPERSONATE = True
+except ImportError:
+    ImpersonateTarget = None  # type: ignore
+    _HAS_IMPERSONATE = False
 
 # -------------------------
 # Environment & logging
@@ -130,76 +139,13 @@ def _patch_ytdlp_yandex_music_https() -> None:
 _patch_ytdlp_yandex_music_https()
 
 # -------------------------
-# Config
+# Config (pydantic-settings)
 # -------------------------
-TOKEN = os.getenv("TOKEN") or os.getenv("BOT_TOKEN")
-ADMIN_ID = int((os.getenv("ADMIN_ID") or "0").strip() or "0")
-INLINE_CACHE_CHAT_ID = int((os.getenv("INLINE_CACHE_CHAT_ID") or "0").strip() or "0")
+from pydantic import AliasChoices, Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
-USERS_FILE = DATA_DIR / "users.txt"
-IG_USER_COOKIES_DIR = DATA_DIR / "ig_user_cookies"
-MAX_COOKIE_UPLOAD_SIZE_MB = int(os.getenv("MAX_COOKIE_UPLOAD_SIZE_MB", "2"))
-EXPECTING_IG_COOKIE_KEY = "awaiting_instagram_cookie_upload"
 
-# Runtime mode
-WEBHOOK_URL = (os.getenv("WEBHOOK_URL") or "").strip()
-WEBHOOK_LISTEN = (os.getenv("WEBHOOK_LISTEN") or "0.0.0.0").strip()
-WEBHOOK_PORT = int((os.getenv("WEBHOOK_PORT") or "8080").strip())
-WEBHOOK_PATH = (os.getenv("WEBHOOK_PATH") or "").strip()
-WEBHOOK_SECRET_TOKEN = (os.getenv("WEBHOOK_SECRET_TOKEN") or "").strip()
-
-# Cache settings
-CACHE_DIR = Path(os.getenv("CACHE_DIR", str(DATA_DIR / "cache")))
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # local-file TTL before tg_file_id (5 min)
-CACHE_TTL_AUDIO_DAYS = int(os.getenv("CACHE_TTL_AUDIO_DAYS", "30"))
-CACHE_TTL_VIDEO_DAYS = int(os.getenv("CACHE_TTL_VIDEO_DAYS", "7"))
-CACHE_MAX_SIZE_MB = int(os.getenv("CACHE_MAX_SIZE_MB", "20000"))  # 20 GB soft limit
-CACHE_CLEAN_INTERVAL_SECONDS = int(os.getenv("CACHE_CLEAN_INTERVAL_SECONDS", "60"))
-INLINE_PREPARE_WAIT_SECONDS = max(
-    0.0,
-    min(8.0, float((os.getenv("INLINE_PREPARE_WAIT_SECONDS") or "8").strip() or "8")),
-)
-
-# Downloader limits
-MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "5"))
-MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "600"))
-MIN_DURATION_SEC = int(os.getenv("MIN_DURATION_SEC", "60"))
-# Backward-compatible: older env used MAX_UPLOAD_MB
-MAX_SIZE_MB = int((os.getenv("MAX_SIZE_MB") or os.getenv("MAX_UPLOAD_MB") or "48").strip())
-MAX_ITEMS_PER_LINK = int(os.getenv("MAX_ITEMS_PER_LINK", "10"))
-TRY_NO_COOKIES_FIRST = (os.getenv("TRY_NO_COOKIES_FIRST", "1").strip() != "0")
-IG_TRY_NO_COOKIES_FIRST = (os.getenv("IG_TRY_NO_COOKIES_FIRST", "0").strip() != "0")
-
-# Network / special cases
-RU_PROXY = (os.getenv("RU_PROXY") or "").strip() or None
-YT_PROXY = (os.getenv("YT_PROXY") or RU_PROXY or "").strip() or None
-YA_PROXY = (os.getenv("YA_PROXY") or os.getenv("YANDEX_MUSIC_PROXY") or RU_PROXY or "").strip() or None
-YA_TOKEN = (os.getenv("YA_TOKEN") or "").strip() or None
-YA_COOKIES_FILES = os.getenv("YA_COOKIES_FILES") or os.getenv("YA_COOKIES_FILE")
-
-# Ad / promo
-AD_URL = (os.getenv("AD_URL") or "").strip() or None
-AD_KEYBOARD_TEXT = (os.getenv("AD_KEYBOARD_TEXT") or "").strip() or None
-AD_TRACK_TEXT = (os.getenv("AD_TRACK_TEXT") or "").strip() or None
-AD_TRACK_EMOJI_LEFT = (os.getenv("AD_TRACK_EMOJI_LEFT") or "").strip() or None
-AD_TRACK_EMOJI_RIGHT = (os.getenv("AD_TRACK_EMOJI_RIGHT") or "").strip() or None
-AD_TRACK_DELAY_SEC = max(1, int(os.getenv("AD_TRACK_DELAY_SEC", "10")))
-AD_VIDEO_TEXT = (os.getenv("AD_VIDEO_TEXT") or "").strip() or None
-AD_VIDEO_EMOJI_LEFT = (os.getenv("AD_VIDEO_EMOJI_LEFT") or "").strip() or None
-AD_VIDEO_EMOJI_RIGHT = (os.getenv("AD_VIDEO_EMOJI_RIGHT") or "").strip() or None
-AD_VIDEO_DELAY_SEC = max(1, int(os.getenv("AD_VIDEO_DELAY_SEC", "10")))
-
-# Audio extraction
-AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "bestaudio/best")
-AUDIO_CODEC = os.getenv("AUDIO_CODEC", "mp3").strip() or "mp3"
-AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "192").strip() or "192"
-AUDIO_SEARCH_PREFIX = os.getenv("AUDIO_SEARCH_PREFIX", "ytsearch1").strip() or "ytsearch1"
-MUSIC_SEARCH_RESULTS = max(1, min(10, int(os.getenv("MUSIC_SEARCH_RESULTS", "10"))))
-MUSIC_SESSION_TTL_SEC = max(10, int(os.getenv("MUSIC_SESSION_TTL_SEC", "60")))
-
-# Format selection (yt-dlp)
-DEFAULT_VIDEO_FORMAT = (
+_DEFAULT_VIDEO_FORMAT = (
     "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
     "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
     "best[vcodec^=avc1][ext=mp4]/"
@@ -207,48 +153,314 @@ DEFAULT_VIDEO_FORMAT = (
     "bv*[ext=mp4]+ba[ext=m4a]/"
     "bv*+ba/best"
 )
-DEFAULT_INSTAGRAM_VIDEO_FORMAT = (
-    "best[ext=mp4]/"
-    f"{DEFAULT_VIDEO_FORMAT}"
-)
-VIDEO_FORMAT = os.getenv("VIDEO_FORMAT", DEFAULT_VIDEO_FORMAT)
-INSTAGRAM_VIDEO_FORMAT = os.getenv("INSTAGRAM_VIDEO_FORMAT", DEFAULT_INSTAGRAM_VIDEO_FORMAT)
-VIDEO_FORMAT_FALLBACK = os.getenv("VIDEO_FORMAT_FALLBACK", "bestvideo*+bestaudio/best")
-INSTAGRAM_VIDEO_FORMAT_FALLBACK = os.getenv("INSTAGRAM_VIDEO_FORMAT_FALLBACK", VIDEO_FORMAT_FALLBACK)
-MERGE_OUTPUT_FORMAT = os.getenv("MERGE_OUTPUT_FORMAT", "mp4")
+_DEFAULT_INSTAGRAM_VIDEO_FORMAT = f"best[ext=mp4]/{_DEFAULT_VIDEO_FORMAT}"
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # Identity / control
+    token: str = Field(default="", validation_alias=AliasChoices("TOKEN", "BOT_TOKEN"))
+    admin_id: int = 0
+    inline_cache_chat_id: int = 0
+
+    # Storage paths
+    data_dir: str = "data"
+    cache_dir: str = ""
+    max_cookie_upload_size_mb: int = 2
+
+    # Webhook
+    webhook_url: str = ""
+    webhook_listen: str = "0.0.0.0"
+    webhook_port: int = 8080
+    webhook_path: str = ""
+    webhook_secret_token: str = ""
+
+    # Cache
+    cache_ttl_seconds: int = 300
+    cache_ttl_audio_days: int = 30
+    cache_ttl_video_days: int = 7
+    cache_max_size_mb: int = 20000
+    cache_clean_interval_seconds: int = 60
+    inline_prepare_wait_seconds: float = 8.0
+
+    # Downloader limits
+    max_concurrent_downloads: int = Field(default=5, ge=1)
+    max_duration_sec: int = 600
+    min_duration_sec: int = 60
+    max_size_mb: int = Field(default=48, validation_alias=AliasChoices("MAX_SIZE_MB", "MAX_UPLOAD_MB"))
+    max_items_per_link: int = 10
+    try_no_cookies_first: bool = True
+    ig_try_no_cookies_first: bool = False
+
+    # Rate limit
+    rate_limit_per_user: int = 12
+    rate_limit_window_sec: int = 600
+
+    # Network
+    ru_proxy: str = ""
+    yt_proxy: str = ""
+    ya_proxy: str = Field(default="", validation_alias=AliasChoices("YA_PROXY", "YANDEX_MUSIC_PROXY"))
+    ya_token: str = ""
+    ya_cookies_files: str = Field(default="", validation_alias=AliasChoices("YA_COOKIES_FILES", "YA_COOKIES_FILE"))
+
+    # Ads
+    ad_url: str = ""
+    ad_keyboard_text: str = ""
+    ad_track_text: str = ""
+    ad_track_emoji_left: str = ""
+    ad_track_emoji_right: str = ""
+    ad_track_delay_sec: int = Field(default=10, ge=1)
+    ad_video_text: str = ""
+    ad_video_emoji_left: str = ""
+    ad_video_emoji_right: str = ""
+    ad_video_delay_sec: int = Field(default=10, ge=1)
+
+    # Audio
+    audio_format: str = "bestaudio/best"
+    audio_codec: str = "mp3"
+    audio_quality: str = "192"
+    audio_search_prefix: str = "ytsearch1"
+    music_search_results: int = Field(default=10, ge=1, le=10)
+    music_session_ttl_sec: int = Field(default=60, ge=10)
+    music_max_pages: int = Field(default=3, ge=1)
+
+    # Video format
+    video_format: str = _DEFAULT_VIDEO_FORMAT
+    instagram_video_format: str = _DEFAULT_INSTAGRAM_VIDEO_FORMAT
+    video_format_fallback: str = "bestvideo*+bestaudio/best"
+    instagram_video_format_fallback: str = ""
+    merge_output_format: str = "mp4"
+
+    # iOS normalization
+    ios_transcode_enabled: bool = True
+    ios_transcode_max_parallel: int = Field(default=1, ge=1)
+    ios_transcode_preset: str = "ultrafast"
+    ios_transcode_crf: int = Field(default=28, ge=18)
+    ios_transcode_max_height: int = Field(default=720, ge=240)
+    ios_transcode_max_width: int = Field(default=1280, ge=240)
+    ios_transcode_max_fps: int = Field(default=30, ge=1)
+
+    # Cookies fallback lists
+    cookies_files: str = Field(default="", validation_alias=AliasChoices("COOKIES_FILES", "COOKIES_FILE"))
+    ig_cookies_files: str = Field(default="", validation_alias=AliasChoices("IG_COOKIES_FILES", "IG_COOKIES_FILE"))
+    yt_cookies_files: str = Field(default="", validation_alias=AliasChoices("YT_COOKIES_FILES", "YT_COOKIES_FILE"))
+    tt_cookies_files: str = Field(default="", validation_alias=AliasChoices("TT_COOKIES_FILES", "TT_COOKIES_FILE"))
+    vk_cookies_files: str = Field(default="", validation_alias=AliasChoices("VK_COOKIES_FILES", "VK_COOKIES_FILE"))
+    sc_cookies_files: str = Field(default="", validation_alias=AliasChoices("SC_COOKIES_FILES", "SC_COOKIES_FILE"))
+
+    # Impersonate
+    impersonate_enabled: bool = True
+    impersonate_target: str = "chrome"
+
+    # Maintenance
+    ytdlp_update_interval_sec: int = Field(default=6 * 3600, ge=300)
+    chart_cache_ttl_sec: int = Field(default=900, ge=60)
+
+    @field_validator("inline_prepare_wait_seconds")
+    @classmethod
+    def _clamp_inline_wait(cls, v: float) -> float:
+        return max(0.0, min(8.0, float(v)))
+
+
+try:
+    settings = Settings()
+except Exception as e:
+    raise SystemExit(f"Config validation failed: {e}")
+
+
+def _nz(s: str | None) -> str | None:
+    s = (s or "").strip()
+    return s or None
+
+
+TOKEN = settings.token or None
+ADMIN_ID = settings.admin_id
+INLINE_CACHE_CHAT_ID = settings.inline_cache_chat_id
+
+DATA_DIR = Path(settings.data_dir)
+USERS_FILE = DATA_DIR / "users.txt"  # legacy plain-text store, kept for migration
+USERS_DB = DATA_DIR / "users.sqlite3"
+IG_USER_COOKIES_DIR = DATA_DIR / "ig_user_cookies"
+MAX_COOKIE_UPLOAD_SIZE_MB = settings.max_cookie_upload_size_mb
+EXPECTING_IG_COOKIE_KEY = "awaiting_instagram_cookie_upload"
+
+WEBHOOK_URL = settings.webhook_url.strip()
+WEBHOOK_LISTEN = settings.webhook_listen.strip() or "0.0.0.0"
+WEBHOOK_PORT = settings.webhook_port
+WEBHOOK_PATH = settings.webhook_path.strip()
+WEBHOOK_SECRET_TOKEN = settings.webhook_secret_token.strip()
+
+CACHE_DIR = Path(settings.cache_dir or str(DATA_DIR / "cache"))
+CACHE_TTL_SECONDS = settings.cache_ttl_seconds
+CACHE_TTL_AUDIO_DAYS = settings.cache_ttl_audio_days
+CACHE_TTL_VIDEO_DAYS = settings.cache_ttl_video_days
+CACHE_MAX_SIZE_MB = settings.cache_max_size_mb
+CACHE_CLEAN_INTERVAL_SECONDS = settings.cache_clean_interval_seconds
+INLINE_PREPARE_WAIT_SECONDS = settings.inline_prepare_wait_seconds
+
+MAX_CONCURRENT_DOWNLOADS = settings.max_concurrent_downloads
+MAX_DURATION_SEC = settings.max_duration_sec
+MIN_DURATION_SEC = settings.min_duration_sec
+MAX_SIZE_MB = settings.max_size_mb
+MAX_ITEMS_PER_LINK = settings.max_items_per_link
+TRY_NO_COOKIES_FIRST = settings.try_no_cookies_first
+IG_TRY_NO_COOKIES_FIRST = settings.ig_try_no_cookies_first
+
+RU_PROXY = _nz(settings.ru_proxy)
+YT_PROXY = _nz(settings.yt_proxy) or RU_PROXY
+YA_PROXY = _nz(settings.ya_proxy) or RU_PROXY
+YA_TOKEN = _nz(settings.ya_token)
+YA_COOKIES_FILES = _nz(settings.ya_cookies_files)
+
+AD_URL = _nz(settings.ad_url)
+AD_KEYBOARD_TEXT = _nz(settings.ad_keyboard_text)
+AD_TRACK_TEXT = _nz(settings.ad_track_text)
+AD_TRACK_EMOJI_LEFT = _nz(settings.ad_track_emoji_left)
+AD_TRACK_EMOJI_RIGHT = _nz(settings.ad_track_emoji_right)
+AD_TRACK_DELAY_SEC = settings.ad_track_delay_sec
+AD_VIDEO_TEXT = _nz(settings.ad_video_text)
+AD_VIDEO_EMOJI_LEFT = _nz(settings.ad_video_emoji_left)
+AD_VIDEO_EMOJI_RIGHT = _nz(settings.ad_video_emoji_right)
+AD_VIDEO_DELAY_SEC = settings.ad_video_delay_sec
+
+AUDIO_FORMAT = settings.audio_format
+AUDIO_CODEC = settings.audio_codec.strip() or "mp3"
+AUDIO_QUALITY = settings.audio_quality.strip() or "192"
+AUDIO_SEARCH_PREFIX = settings.audio_search_prefix.strip() or "ytsearch1"
+MUSIC_SEARCH_RESULTS = settings.music_search_results
+MUSIC_SESSION_TTL_SEC = settings.music_session_ttl_sec
+
+DEFAULT_VIDEO_FORMAT = _DEFAULT_VIDEO_FORMAT
+DEFAULT_INSTAGRAM_VIDEO_FORMAT = _DEFAULT_INSTAGRAM_VIDEO_FORMAT
+VIDEO_FORMAT = settings.video_format
+INSTAGRAM_VIDEO_FORMAT = settings.instagram_video_format
+VIDEO_FORMAT_FALLBACK = settings.video_format_fallback
+INSTAGRAM_VIDEO_FORMAT_FALLBACK = settings.instagram_video_format_fallback or VIDEO_FORMAT_FALLBACK
+MERGE_OUTPUT_FORMAT = settings.merge_output_format
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
 AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mka", ".mp3", ".oga", ".ogg", ".opus", ".wav", ".weba"}
+
+IMPERSONATE_ENABLED = settings.impersonate_enabled
+IMPERSONATE_TARGET = settings.impersonate_target.strip() or "chrome"
+IMPERSONATE_SITES = {"instagram", "tiktok"}
 IOS_SAFE_VIDEO_CODEC = "h264"
 IOS_SAFE_AUDIO_CODECS = {"aac"}
 IOS_SAFE_PIXEL_FORMATS = {"yuv420p"}
-IOS_TRANSCODE_ENABLED = (os.getenv("IOS_TRANSCODE_ENABLED", "1").strip() != "0")
-IOS_TRANSCODE_MAX_PARALLEL = max(1, int(os.getenv("IOS_TRANSCODE_MAX_PARALLEL", "1")))
-IOS_TRANSCODE_PRESET = os.getenv("IOS_TRANSCODE_PRESET", "ultrafast").strip() or "ultrafast"
-IOS_TRANSCODE_CRF = max(18, int(os.getenv("IOS_TRANSCODE_CRF", "28")))
-IOS_TRANSCODE_MAX_HEIGHT = max(240, int(os.getenv("IOS_TRANSCODE_MAX_HEIGHT", "720")))
-IOS_TRANSCODE_MAX_WIDTH = max(240, int(os.getenv("IOS_TRANSCODE_MAX_WIDTH", "1280")))
-IOS_TRANSCODE_MAX_FPS = max(1, int(os.getenv("IOS_TRANSCODE_MAX_FPS", "30")))
+IOS_TRANSCODE_ENABLED = settings.ios_transcode_enabled
+IOS_TRANSCODE_MAX_PARALLEL = settings.ios_transcode_max_parallel
+IOS_TRANSCODE_PRESET = settings.ios_transcode_preset
+IOS_TRANSCODE_CRF = settings.ios_transcode_crf
+IOS_TRANSCODE_MAX_HEIGHT = settings.ios_transcode_max_height
+IOS_TRANSCODE_MAX_WIDTH = settings.ios_transcode_max_width
+IOS_TRANSCODE_MAX_FPS = settings.ios_transcode_max_fps
 
 # Cookie fallback lists (comma / semicolon / newline separated)
-COOKIES_FILES = os.getenv("COOKIES_FILES") or os.getenv("COOKIES_FILE")
-IG_COOKIES_FILES = os.getenv("IG_COOKIES_FILES") or os.getenv("IG_COOKIES_FILE")
-YT_COOKIES_FILES = os.getenv("YT_COOKIES_FILES") or os.getenv("YT_COOKIES_FILE")
-TT_COOKIES_FILES = os.getenv("TT_COOKIES_FILES") or os.getenv("TT_COOKIES_FILE")
-VK_COOKIES_FILES = os.getenv("VK_COOKIES_FILES") or os.getenv("VK_COOKIES_FILE")
-SC_COOKIES_FILES = os.getenv("SC_COOKIES_FILES") or os.getenv("SC_COOKIES_FILE")
+COOKIES_FILES = _nz(settings.cookies_files)
+IG_COOKIES_FILES = _nz(settings.ig_cookies_files)
+YT_COOKIES_FILES = _nz(settings.yt_cookies_files)
+TT_COOKIES_FILES = _nz(settings.tt_cookies_files)
+VK_COOKIES_FILES = _nz(settings.vk_cookies_files)
+SC_COOKIES_FILES = _nz(settings.sc_cookies_files)
 
 # Semaphore to limit parallel downloads
 sema = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 ios_transcode_sema = threading.Semaphore(IOS_TRANSCODE_MAX_PARALLEL)
+
+# Per-user rate limiting (sliding window)
+RATE_LIMIT_PER_USER = max(0, settings.rate_limit_per_user)
+RATE_LIMIT_WINDOW_SEC = max(1, settings.rate_limit_window_sec)
+_user_request_log: dict[int, list[float]] = {}
+
+
+def _check_rate_limit(user_id: int | None) -> tuple[bool, float]:
+    """Sliding-window per-user limit. Returns (allowed, retry_after_sec)."""
+    if not user_id or RATE_LIMIT_PER_USER <= 0 or (ADMIN_ID and user_id == ADMIN_ID):
+        return True, 0.0
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW_SEC
+    bucket = _user_request_log.setdefault(user_id, [])
+    # prune
+    bucket[:] = [t for t in bucket if t > window_start]
+    if len(bucket) >= RATE_LIMIT_PER_USER:
+        retry_after = bucket[0] + RATE_LIMIT_WINDOW_SEC - now
+        return False, max(1.0, retry_after)
+    bucket.append(now)
+    return True, 0.0
 
 # Per-URL locks to avoid duplicate downloads
 _cache_locks: dict[str, asyncio.Lock] = {}
 
 # In-memory cache index (also persisted in meta.json)
 _cache_index: dict[str, dict[str, Any]] = {}
+
+# Cache hit/miss counters (reset on restart).
+_cache_stats_counter: dict[str, int] = {"audio_hit": 0, "audio_miss": 0, "media_hit": 0, "media_miss": 0}
+_cache_stats_lock = threading.Lock()
+
+
+def _cache_count(kind: str, hit: bool) -> None:
+    bucket = f"{kind}_{'hit' if hit else 'miss'}"
+    with _cache_stats_lock:
+        _cache_stats_counter[bucket] = _cache_stats_counter.get(bucket, 0) + 1
+
+
+def _cache_counter_snapshot() -> dict[str, int]:
+    with _cache_stats_lock:
+        return dict(_cache_stats_counter)
 _last_success_cookie_by_site: dict[str, str | None] = {}
 _last_success_cookie_lock = threading.Lock()
+
+# Demoted cookies (cookiefile path → unhealthy_until_ts).
+# Skipped during attempts; re-enabled after IG_COOKIE_DEMOTE_SEC.
+IG_COOKIE_DEMOTE_SEC = 6 * 3600
+_unhealthy_cookies: dict[str, float] = {}
+_unhealthy_cookies_lock = threading.Lock()
+
+
+def _is_cookie_unhealthy(cookiefile: str | None) -> bool:
+    if not cookiefile:
+        return False
+    with _unhealthy_cookies_lock:
+        ts = _unhealthy_cookies.get(cookiefile)
+        if ts is None:
+            return False
+        if time.time() > ts:
+            _unhealthy_cookies.pop(cookiefile, None)
+            return False
+        return True
+
+
+def _demote_cookie(cookiefile: str | None, reason: str) -> None:
+    if not cookiefile:
+        return
+    with _unhealthy_cookies_lock:
+        _unhealthy_cookies[cookiefile] = time.time() + IG_COOKIE_DEMOTE_SEC
+    logger.warning("Cookie демотирован на %dч: %s — %s", IG_COOKIE_DEMOTE_SEC // 3600, cookiefile, reason)
+
+
+_LOGIN_REQUIRED_PATTERNS = (
+    "login_required",
+    "login required",
+    "rate-limit reached",
+    "sessionid",
+    "main_account_blocked",
+    "checkpoint_required",
+    "consent required",
+    "please log in",
+    "you must be logged in",
+)
+
+
+def _looks_like_cookie_failure(err_text: str) -> bool:
+    low = err_text.lower()
+    return any(p in low for p in _LOGIN_REQUIRED_PATTERNS)
 
 # Inline cache warm-up tasks. Inline answers must be fast, so expensive downloads
 # are prepared in the background and served from Telegram file_id on the next query.
@@ -261,7 +473,7 @@ _INLINE_FAILURE_TTL_SEC = 300
 
 # Pending /music search sessions: session_id -> {all, offset, page_size}
 _music_search_sessions: dict[str, dict[str, Any]] = {}
-_MUSIC_MAX_PAGES = max(1, int(os.getenv("MUSIC_MAX_PAGES", "3")))
+_MUSIC_MAX_PAGES = settings.music_max_pages
 
 # Strong refs to background tasks — prevents GC from collecting them mid-await
 _bg_tasks: set[asyncio.Task] = set()
@@ -321,13 +533,55 @@ def _ensure_dirs() -> None:
     IG_USER_COOKIES_DIR.mkdir(parents=True, exist_ok=True)
 
 
-YTDLP_UPDATE_INTERVAL_SEC = int(os.getenv("YTDLP_UPDATE_INTERVAL_SEC", str(6 * 3600)))
+def _cleanup_orphan_tmp_dirs() -> None:
+    """Remove leftover /tmp/dl_* /tmp/music_* from previous crashed runs."""
+    tmp_root = Path("/tmp")
+    if not tmp_root.exists():
+        return
+    removed = 0
+    for prefix in ("dl_", "music_"):
+        for p in tmp_root.glob(f"{prefix}*"):
+            try:
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                    removed += 1
+            except Exception:
+                pass
+    if removed:
+        logger.info("Очищено осиротевших tmp каталогов: %d", removed)
 
 
-def auto_update_ytdlp() -> None:
-    """Update yt-dlp via pip. Called at startup and periodically."""
+YTDLP_UPDATE_INTERVAL_SEC = settings.ytdlp_update_interval_sec
+
+
+def _current_ytdlp_version() -> str | None:
     try:
-        logger.info("Проверяю обновления yt-dlp…")
+        from yt_dlp.version import __version__ as v  # type: ignore
+        return str(v)
+    except Exception:
+        return None
+
+
+def _latest_ytdlp_version() -> str | None:
+    try:
+        resp = _TG_HTTP_SESSION.get("https://pypi.org/pypi/yt-dlp/json", timeout=10)
+        if resp.status_code != 200:
+            return None
+        return resp.json().get("info", {}).get("version")
+    except Exception as e:
+        logger.debug("Проверка версии yt-dlp на PyPI не удалась: %s", e)
+        return None
+
+
+def auto_update_ytdlp(force: bool = False) -> None:
+    """Update yt-dlp via pip only when PyPI shows a newer version. Called at startup and periodically."""
+    try:
+        current = _current_ytdlp_version()
+        latest = _latest_ytdlp_version()
+        if not force and current and latest and current == latest:
+            logger.info("yt-dlp актуален: %s", current)
+            return
+        logger.info("Обновляю yt-dlp: %s → %s", current or "?", latest or "?")
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
             check=False,
@@ -339,7 +593,7 @@ def auto_update_ytdlp() -> None:
         out = (result.stdout or "") + (result.stderr or "")
         if "Successfully installed" in out:
             logger.info("yt-dlp обновлён")
-        elif "Requirement already satisfied" in out or "up-to-date" in out.lower():
+        elif "Requirement already satisfied" in out:
             logger.info("yt-dlp уже актуален")
         else:
             logger.warning("yt-dlp update unclear: rc=%d", result.returncode)
@@ -355,19 +609,83 @@ async def ytdlp_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     await asyncio.to_thread(auto_update_ytdlp)
 
 
-def save_user(chat_id: int) -> None:
-    """Сохраняет chat_id пользователя в файл, если его ещё нет."""
-    try:
-        _ensure_dirs()
-        if not USERS_FILE.exists():
-            USERS_FILE.write_text("", encoding="utf-8")
+_users_db_lock = threading.Lock()
 
-        users = set(USERS_FILE.read_text(encoding="utf-8").splitlines())
-        if str(chat_id) not in users:
-            with USERS_FILE.open("a", encoding="utf-8") as f:
-                f.write(f"{chat_id}\n")
+
+def _users_db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(USERS_DB), timeout=10, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def _users_db_init() -> None:
+    _ensure_dirs()
+    with _users_db_lock, _users_db_connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id     INTEGER PRIMARY KEY,
+                first_seen  REAL NOT NULL,
+                last_seen   REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen);
+            """
+        )
+        # One-shot migration from users.txt
+        if USERS_FILE.exists():
+            try:
+                ids: list[int] = []
+                for line in USERS_FILE.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line.isdigit():
+                        ids.append(int(line))
+                if ids:
+                    now = time.time()
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO users(chat_id, first_seen, last_seen) VALUES (?, ?, ?)",
+                        [(uid, now, now) for uid in ids],
+                    )
+                    logger.info("users.txt → SQLite: импортировано %d записей", len(ids))
+                # Keep users.txt as backup with .migrated suffix
+                backup = USERS_FILE.with_suffix(".txt.migrated")
+                if not backup.exists():
+                    USERS_FILE.rename(backup)
+            except Exception as e:
+                logger.warning("Миграция users.txt в SQLite не удалась: %s", e)
+
+
+def save_user(chat_id: int) -> None:
+    """Insert/update user record."""
+    try:
+        now = time.time()
+        with _users_db_lock, _users_db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO users(chat_id, first_seen, last_seen) VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET last_seen=excluded.last_seen
+                """,
+                (chat_id, now, now),
+            )
     except Exception as e:
         logger.error(f"Ошибка сохранения пользователя: {e}")
+
+
+def _users_count() -> int:
+    try:
+        with _users_db_lock, _users_db_connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+            return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def _users_all_ids() -> list[int]:
+    try:
+        with _users_db_lock, _users_db_connect() as conn:
+            return [int(r[0]) for r in conn.execute("SELECT chat_id FROM users ORDER BY chat_id").fetchall()]
+    except Exception:
+        return []
 
 
 def _parse_cookie_files(value: str | None) -> list[str]:
@@ -505,7 +823,8 @@ def _try_no_cookies_first_for_site(site: str, cookie_files: list[str]) -> bool:
 
 
 def _ordered_download_attempts(site: str, cookie_files: list[str]) -> list[str | None]:
-    ordered_cookies = list(cookie_files)
+    # Drop unhealthy cookies (re-eligible after demote TTL).
+    ordered_cookies = [c for c in cookie_files if not _is_cookie_unhealthy(c)]
     with _last_success_cookie_lock:
         last_success_cookie = _last_success_cookie_by_site.get(site)
 
@@ -570,6 +889,7 @@ def _cache_dir_for_key(key: str) -> Path:
 
 
 def _meta_path_for_key(key: str) -> Path:
+    """Legacy per-entry meta.json path. Kept for migration of pre-SQLite cache."""
     return _cache_dir_for_key(key) / "meta.json"
 
 
@@ -584,34 +904,120 @@ def _is_entry_expired(entry: dict[str, Any]) -> bool:
         return True
 
 
-def _load_cache_index_from_disk() -> None:
-    """Load any non-expired cache entries from disk on startup."""
+# Cache index SQLite store
+CACHE_DB = DATA_DIR / "cache_index.sqlite3"
+_cache_db_lock = threading.Lock()
+
+
+def _cache_db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(CACHE_DB), timeout=10, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def _cache_db_init() -> None:
     _ensure_dirs()
-    loaded = 0
-    for d in CACHE_DIR.iterdir():
-        if not d.is_dir():
-            continue
-        meta_path = d / "meta.json"
-        if not meta_path.exists():
-            continue
-        try:
-            entry = json.loads(meta_path.read_text(encoding="utf-8"))
-            key = str(entry.get("key") or d.name)
-            if _is_entry_expired(entry):
+    with _cache_db_lock, _cache_db_connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS cache_entries (
+                key         TEXT PRIMARY KEY,
+                expires_at  REAL NOT NULL,
+                site        TEXT,
+                data        TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cache_expires ON cache_entries(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_cache_site ON cache_entries(site);
+            """
+        )
+
+
+def _cache_db_upsert(key: str, entry: dict[str, Any]) -> None:
+    payload = json.dumps(entry, ensure_ascii=False)
+    expires_at = float(entry.get("expires_at", 0) or 0)
+    site = entry.get("site") or "unknown"
+    with _cache_db_lock, _cache_db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO cache_entries(key, expires_at, site, data)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                expires_at=excluded.expires_at,
+                site=excluded.site,
+                data=excluded.data
+            """,
+            (key, expires_at, site, payload),
+        )
+
+
+def _cache_db_delete(key: str) -> None:
+    with _cache_db_lock, _cache_db_connect() as conn:
+        conn.execute("DELETE FROM cache_entries WHERE key = ?", (key,))
+
+
+def _cache_db_load_all() -> list[tuple[str, dict[str, Any]]]:
+    out: list[tuple[str, dict[str, Any]]] = []
+    try:
+        with _cache_db_lock, _cache_db_connect() as conn:
+            now = time.time()
+            cursor = conn.execute(
+                "SELECT key, data FROM cache_entries WHERE expires_at > ?",
+                (now,),
+            )
+            for row in cursor:
+                try:
+                    out.append((row[0], json.loads(row[1])))
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.warning("Cache DB read failed: %s", e)
+    return out
+
+
+def _migrate_legacy_meta_json() -> int:
+    """Import old per-dir meta.json files into SQLite (one-shot)."""
+    migrated = 0
+    try:
+        for d in CACHE_DIR.iterdir():
+            if not d.is_dir():
                 continue
-            _cache_index[key] = entry
-            loaded += 1
-        except Exception:
-            continue
-    if loaded:
-        logger.info(f"Кэш загружен: {loaded} записей")
+            meta_path = d / "meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                entry = json.loads(meta_path.read_text(encoding="utf-8"))
+                key = str(entry.get("key") or d.name)
+                if _is_entry_expired(entry):
+                    continue
+                _cache_db_upsert(key, entry)
+                migrated += 1
+                meta_path.unlink(missing_ok=True)
+            except Exception:
+                continue
+    except FileNotFoundError:
+        pass
+    return migrated
+
+
+def _load_cache_index_from_disk() -> None:
+    """Populate in-memory _cache_index from SQLite. Migrate any legacy meta.json on first run."""
+    _cache_db_init()
+    legacy = _migrate_legacy_meta_json()
+    if legacy:
+        logger.info("Cache index: импортировано %d записей из meta.json в SQLite", legacy)
+    for key, entry in _cache_db_load_all():
+        _cache_index[key] = entry
+    if _cache_index:
+        logger.info("Кэш загружен: %d записей", len(_cache_index))
 
 
 def _purge_cache_entry(key: str) -> None:
-    """Remove cache entry (meta + files)."""
+    """Remove cache entry (DB row + on-disk files)."""
     try:
         _cache_index.pop(key, None)
         _cache_locks.pop(key, None)
+        _cache_db_delete(key)
         d = _cache_dir_for_key(key)
         if d.exists() and d.is_dir():
             shutil.rmtree(d, ignore_errors=True)
@@ -629,21 +1035,16 @@ def cleanup_cache() -> int:
             _purge_cache_entry(key)
             deleted += 1
 
-    # 2. TTL-based cleanup (disk leftovers)
-    for d in list(CACHE_DIR.iterdir()):
-        if not d.is_dir():
-            continue
-        meta_path = d / "meta.json"
-        if not meta_path.exists():
-            shutil.rmtree(d, ignore_errors=True)
-            continue
-        try:
-            entry = json.loads(meta_path.read_text(encoding="utf-8"))
-            if _is_entry_expired(entry):
+    # 2. Orphan dir cleanup: any cache dir without matching DB row → remove
+    try:
+        known_keys = set(_cache_index.keys())
+        for d in list(CACHE_DIR.iterdir()):
+            if not d.is_dir():
+                continue
+            if d.name not in known_keys:
                 shutil.rmtree(d, ignore_errors=True)
-                deleted += 1
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     # 3. Size-based eviction: if total cache exceeds CACHE_MAX_SIZE_MB
     if CACHE_MAX_SIZE_MB > 0:
@@ -1128,7 +1529,13 @@ def _normalize_downloaded_files(files: list[Path]) -> list[Path]:
     return normalized
 
 
-def _ytdlp_common_opts(outtmpl: str, cookiefile: str | None = None, proxy: str | None = None) -> dict[str, Any]:
+def _ytdlp_common_opts(
+    outtmpl: str,
+    cookiefile: str | None = None,
+    proxy: str | None = None,
+    *,
+    site: str | None = None,
+) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -1150,6 +1557,11 @@ def _ytdlp_common_opts(outtmpl: str, cookiefile: str | None = None, proxy: str |
         opts["geo_verification_proxy"] = proxy
     if cookiefile and os.path.exists(cookiefile):
         opts["cookiefile"] = cookiefile
+    if IMPERSONATE_ENABLED and _HAS_IMPERSONATE and site in IMPERSONATE_SITES:
+        try:
+            opts["impersonate"] = ImpersonateTarget.from_str(IMPERSONATE_TARGET)
+        except Exception as e:
+            logger.debug("impersonate target invalid (%s): %s", IMPERSONATE_TARGET, e)
     return opts
 
 
@@ -1208,7 +1620,7 @@ def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | No
 
     outtmpl = str(workdir / "%(id)s_%(playlist_index)s.%(ext)s")
     def _build_opts(fmt: str) -> dict[str, Any]:
-        opts = _ytdlp_common_opts(outtmpl=outtmpl, cookiefile=cookiefile)
+        opts = _ytdlp_common_opts(outtmpl=outtmpl, cookiefile=cookiefile, site=site)
         if site == "instagram":
             opts["noplaylist"] = False
             opts["playlistend"] = max(1, min(MAX_ITEMS_PER_LINK, 50))
@@ -1324,6 +1736,8 @@ def download_media_with_fallback(
             last_err_text = str(e)
             logger.warning(f"[{site}] yt-dlp DownloadError: {e}")
             err_lower = str(e).lower()
+            if cookiefile and _looks_like_cookie_failure(err_lower):
+                _demote_cookie(cookiefile, last_err_text[:120])
             if site == "instagram" and ("no video" in err_lower or "there is no video" in err_lower):
                 raise UserFacingDownloadError(
                     "Фото-посты Instagram не поддерживаются — только Reels и Stories."
@@ -1332,6 +1746,8 @@ def download_media_with_fallback(
             last_err = e
             last_err_text = str(e)
             logger.warning(f"[{site}] Ошибка скачивания: {e}")
+            if cookiefile and _looks_like_cookie_failure(str(e)):
+                _demote_cookie(cookiefile, str(e)[:120])
 
     raise RuntimeError(last_err_text or "Не удалось скачать медиа.") from last_err
 
@@ -1348,7 +1764,7 @@ def _write_cache_entry(entry: dict[str, Any]) -> None:
         entry["expires_at"] = _now() + long_ttl
         _delete_entry_local_files(entry)
 
-    _meta_path_for_key(key).write_text(json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8")
+    _cache_db_upsert(key, entry)
     _cache_index[key] = entry
 
 
@@ -1891,7 +2307,7 @@ def _download_audio_with_cookie(
         target = _normalize_yandex_music_url(source_url, cookiefile=cookiefile, proxy=proxy)
 
     outtmpl = str(workdir / "%(playlist_index)s_%(title).180B_%(id)s.%(ext)s")
-    opts = _ytdlp_common_opts(outtmpl=outtmpl, proxy=proxy, cookiefile=cookiefile)
+    opts = _ytdlp_common_opts(outtmpl=outtmpl, proxy=proxy, cookiefile=cookiefile, site=site)
     noplaylist = _audio_noplaylist(site, target if source_url else None)
     opts.update({
         "format": AUDIO_FORMAT,
@@ -2123,13 +2539,16 @@ async def _get_or_download_audio_entry(
 
     entry = _cache_index.get(key)
     if entry and _cache_entry_is_usable(entry):
+        _cache_count("audio", True)
         return entry
 
     lock = _get_or_create_lock(key)
     async with lock:
         entry = _cache_index.get(key)
         if entry and _cache_entry_is_usable(entry):
+            _cache_count("audio", True)
             return entry
+        _cache_count("audio", False)
 
         tmp_dir = Path("/tmp") / f"music_{key[:12]}_{uuid.uuid4().hex[:8]}"
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -2237,10 +2656,34 @@ def _should_exclude_chart_track(title: str, artist: str = "") -> bool:
     return False
 
 
+_CHART_CACHE_TTL_SEC = settings.chart_cache_ttl_sec
+_chart_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def _chart_cache_get(key: str) -> list[dict[str, Any]] | None:
+    entry = _chart_cache.get(key)
+    if entry is None:
+        return None
+    ts, data = entry
+    if _now() - ts > _CHART_CACHE_TTL_SEC:
+        _chart_cache.pop(key, None)
+        return None
+    return data
+
+
+def _chart_cache_set(key: str, data: list[dict[str, Any]]) -> None:
+    if data:
+        _chart_cache[key] = (_now(), data)
+
+
 def _fetch_yandex_chart(n: int) -> list[dict[str, Any]]:
     """Fetch world chart tracks from Yandex Music API."""
     if not YA_TOKEN:
         return []
+    cache_key = f"ya_chart:world:{n}"
+    cached = _chart_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         from yandex_music import Client as _YMClient
         from yandex_music.utils.request import Request as _YMRequest
@@ -2273,6 +2716,7 @@ def _fetch_yandex_chart(n: int) -> list[dict[str, Any]]:
                 "duration": dur_sec,
                 "source": "yandex_music",
             })
+        _chart_cache_set(cache_key, results)
         return results
     except Exception as e:
         logger.warning("Yandex Music chart failed: %s", e)
@@ -2286,6 +2730,10 @@ def _fetch_sc_playlist_api(url: str, n: int) -> list[dict[str, Any]]:
     the rest are MiniTrack stubs with only an id. We collect stub ids and fetch
     their full metadata in one batch call via get_tracks().
     """
+    cache_key = f"sc_playlist:{url}:{n}"
+    cached = _chart_cache_get(cache_key)
+    if cached is not None:
+        return cached
     try:
         from soundcloud import SoundCloud  # type: ignore
     except ImportError:
@@ -2342,6 +2790,7 @@ def _fetch_sc_playlist_api(url: str, n: int) -> list[dict[str, Any]]:
                 "source": "sc",
             })
         logger.info("SC API playlist '%s': %d tracks after filtering", url, len(results))
+        _chart_cache_set(cache_key, results)
         return results
     except Exception as e:
         logger.warning("SC API playlist fetch failed for %s: %s", url, e)
@@ -2366,11 +2815,7 @@ async def get_users_count(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     try:
-        if not USERS_FILE.exists():
-            users_count = 0
-        else:
-            users_count = len(USERS_FILE.read_text(encoding="utf-8").splitlines())
-
+        users_count = _users_count()
         await update.message.reply_text(f"👥 Всего пользователей: {users_count}")
     except Exception as e:
         logger.error(f"Ошибка получения количества пользователей: {e}")
@@ -2448,13 +2893,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("❌ У вас нет прав.")
         return
 
-    # Users
-    users_count = 0
-    try:
-        if USERS_FILE.exists():
-            users_count = len([l for l in USERS_FILE.read_text(encoding="utf-8").splitlines() if l.strip()])
-    except Exception:
-        pass
+    users_count = _users_count()
 
     # Cache
     stats = _collect_cache_stats()
@@ -2479,12 +2918,28 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         cookie_lines = "  нет загруженных cookies\n"
 
+    counts = _cache_counter_snapshot()
+    a_hit, a_miss = counts.get("audio_hit", 0), counts.get("audio_miss", 0)
+    v_hit, v_miss = counts.get("media_hit", 0), counts.get("media_miss", 0)
+
+    def _ratio(hit: int, miss: int) -> str:
+        total = hit + miss
+        if total == 0:
+            return "—"
+        return f"{100 * hit / total:.1f}%"
+
+    hit_rate_lines = (
+        f"  🎵 Аудио: hit={a_hit} miss={a_miss} ({_ratio(a_hit, a_miss)})\n"
+        f"  🎬 Медиа: hit={v_hit} miss={v_miss} ({_ratio(v_hit, v_miss)})\n"
+    )
+
     text = (
         f"<b>📊 Статистика бота</b>\n\n"
         f"<b>👥 Пользователей:</b> {users_count:,}\n\n"
         f"<b>📦 Кэш:</b> {total_entries} записей · {size_str}\n"
         f"  🎵 Аудио: {stats['audio']}\n"
         f"  🎬 Видео/фото: {stats['video']}\n\n"
+        f"<b>⚡ Cache hit-rate (с рестарта):</b>\n{hit_rate_lines}\n"
         f"<b>📈 По источникам:</b>\n{by_site_lines}\n"
         f"<b>🍪 Instagram cookies:</b>\n{cookie_lines}"
     )
@@ -2786,6 +3241,13 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if task and not task.done():
             task.cancel()
 
+    allowed, retry_after = _check_rate_limit(requester_id)
+    if not allowed:
+        await cq.edit_message_text(
+            f"Слишком много запросов. Попробуй через {int(retry_after)} сек."
+        )
+        return
+
     await cq.edit_message_text(f"Скачиваю: {title}…")
 
     async with sema:
@@ -2885,6 +3347,12 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # URL → качаем напрямую
     if _looks_like_url(source):
+        allowed, retry_after = _check_rate_limit(requester_id)
+        if not allowed:
+            await update.message.reply_text(
+                f"Слишком много запросов. Попробуй через {int(retry_after)} сек."
+            )
+            return
         async with sema:
             try:
                 entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
@@ -3056,6 +3524,13 @@ async def ytmusic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     requester_id = update.effective_user.id if update.effective_user else None
 
+    allowed, retry_after = _check_rate_limit(requester_id)
+    if not allowed:
+        await update.message.reply_text(
+            f"Слишком много запросов. Попробуй через {int(retry_after)} сек."
+        )
+        return
+
     async with sema:
         try:
             entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
@@ -3157,13 +3632,16 @@ async def _get_or_download_media_entry(
 
     entry = _cache_index.get(key)
     if entry and _cache_entry_is_usable(entry):
+        _cache_count("media", True)
         return entry
 
     lock = _get_or_create_lock(key)
     async with lock:
         entry = _cache_index.get(key)
         if entry and _cache_entry_is_usable(entry):
+            _cache_count("media", True)
             return entry
+        _cache_count("media", False)
 
         tmp_dir = Path("/tmp") / f"dl_{key[:12]}_{uuid.uuid4().hex[:8]}"
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -4001,9 +4479,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    music_source = _extract_inline_music_source(text)
+    is_video = _looks_like_supported_video_url(text)
+    if music_source or is_video:
+        allowed, retry_after = _check_rate_limit(requester_id)
+        if not allowed:
+            await update.message.reply_text(
+                f"Слишком много запросов. Попробуй через {int(retry_after)} сек."
+            )
+            return
+
     async with sema:
         # 1) Music URLs and /music routed audio-only requests
-        music_source = _extract_inline_music_source(text)
         if music_source:
             try:
                 entry = await _get_or_download_audio_entry(music_source, requester_id=requester_id)
@@ -4016,7 +4503,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         # 2) Supported video/media URLs only
-        if _looks_like_supported_video_url(text):
+        if is_video:
             url = text
             try:
                 entry = await _get_or_download_media_entry(url, requester_id=requester_id)
@@ -4078,13 +4565,9 @@ def _parse_id_list(text: str) -> list[int]:
 
 
 def _bcast_get_recipients(filter_mode: str, exclude_ids: list[int], only_ids: list[int]) -> list[int]:
-    if not USERS_FILE.exists():
+    all_ids = _users_all_ids()
+    if not all_ids:
         return []
-    all_ids = [
-        int(line.strip())
-        for line in USERS_FILE.read_text(encoding="utf-8").splitlines()
-        if line.strip().isdigit()
-    ]
     if filter_mode == "only":
         only_set = set(only_ids)
         return [uid for uid in all_ids if uid in only_set]
@@ -4297,7 +4780,6 @@ async def broadcast_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                         chat_id=uid,
                         text=bcast_text,
                         parse_mode="HTML",
-                        link_preview_options=LinkPreviewOptions(is_disabled=True),
                     )
                     sent += 1
                     break
@@ -4441,11 +4923,43 @@ async def _set_bot_commands(app: Application) -> None:
     await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
 
 
+async def _post_stop(app: Application) -> None:
+    """Graceful shutdown: cancel bg tasks, flush state."""
+    logger.info("Shutdown: отменяю фоновые задачи (%d)", len(_bg_tasks))
+    pending = list(_bg_tasks)
+    for task in pending:
+        if not task.done():
+            task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    # Cancel music session delete timers
+    for sess in list(_music_search_sessions.values()):
+        t = sess.get("delete_task")
+        if t and not t.done():
+            t.cancel()
+    # Cancel inline prepare tasks
+    for t in list(_inline_prepare_tasks.values()):
+        if t and not t.done():
+            t.cancel()
+    logger.info("Shutdown complete")
+
+
 def build_application() -> Application:
     if not TOKEN:
         raise RuntimeError("Не найден TOKEN (или BOT_TOKEN) в .env")
 
-    app = ApplicationBuilder().token(TOKEN).post_init(_set_bot_commands).build()
+    defaults = Defaults(
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .defaults(defaults)
+        .post_init(_set_bot_commands)
+        .post_stop(_post_stop)
+        .concurrent_updates(True)
+        .build()
+    )
 
     app.add_handler(CommandHandler("pechenyuha", pechenyuha_command))
     app.add_handler(CommandHandler("users", get_users_count))
@@ -4485,6 +4999,9 @@ def build_application() -> Application:
 
 def main() -> None:
     _ensure_dirs()
+    _cleanup_orphan_tmp_dirs()
+    _users_db_init()
+    _cache_db_init()
     _load_cache_index_from_disk()
     auto_update_ytdlp()
 
