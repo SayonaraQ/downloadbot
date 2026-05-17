@@ -3071,12 +3071,33 @@ def _build_ad_caption() -> tuple[str, str] | None:
 
 
 async def _remove_caption_after(bot: Any, chat_id: int, message_id: int, delay: float) -> None:
-    """Edit audio caption to empty after delay (removes ad text, keeps the track)."""
+    """Strip ad caption after delay (keep audio/video, drop formatting + entities)."""
     await asyncio.sleep(delay)
     try:
-        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption="")
-    except Exception:
-        pass
+        await bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=message_id,
+            caption=None,
+            parse_mode=None,
+            caption_entities=[],
+        )
+    except BadRequest as e:
+        # "message is not modified" — already cleared, nothing to do
+        if "not modified" in str(e).lower():
+            return
+        # Fallback: try with explicit empty string
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption="",
+                parse_mode=None,
+                caption_entities=[],
+            )
+        except Exception as e2:
+            logger.debug("edit_message_caption fallback failed: %s", e2)
+    except Exception as e:
+        logger.debug("edit_message_caption failed: %s", e)
 
 
 def _music_search_keyboard(
