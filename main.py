@@ -80,6 +80,25 @@ except ImportError:
     ImpersonateTarget = None  # type: ignore
     _HAS_IMPERSONATE = False
 
+
+# Runtime flag — flipped to False if downloads fail with "Impersonate target ... is not available".
+_impersonate_disabled = threading.Event()
+
+
+def _disable_impersonate(reason: str) -> None:
+    if not _impersonate_disabled.is_set():
+        _impersonate_disabled.set()
+        logger.warning("Impersonate отключён глобально: %s", reason)
+
+
+def _impersonate_available_at_runtime() -> bool:
+    return _HAS_IMPERSONATE and IMPERSONATE_ENABLED and not _impersonate_disabled.is_set()
+
+
+def _looks_like_impersonate_missing(err_text: str) -> bool:
+    low = err_text.lower()
+    return "impersonate target" in low and "is not available" in low
+
 # -------------------------
 # Environment & logging
 # -------------------------
@@ -1557,7 +1576,7 @@ def _ytdlp_common_opts(
         opts["geo_verification_proxy"] = proxy
     if cookiefile and os.path.exists(cookiefile):
         opts["cookiefile"] = cookiefile
-    if IMPERSONATE_ENABLED and _HAS_IMPERSONATE and site in IMPERSONATE_SITES:
+    if _impersonate_available_at_runtime() and site in IMPERSONATE_SITES:
         try:
             opts["impersonate"] = ImpersonateTarget.from_str(IMPERSONATE_TARGET)
         except Exception as e:
@@ -1714,7 +1733,10 @@ def download_media_with_fallback(
     last_err: Exception | None = None
     last_err_text: str | None = None
 
-    for idx, cookiefile in enumerate(attempts, start=1):
+    idx = 0
+    while idx < len(attempts):
+        cookiefile = attempts[idx]
+        idx += 1
         # Ensure temp directory is clean between attempts
         try:
             for p in tmp_dir.glob("*"):
@@ -1736,6 +1758,11 @@ def download_media_with_fallback(
             last_err_text = str(e)
             logger.warning(f"[{site}] yt-dlp DownloadError: {e}")
             err_lower = str(e).lower()
+            if _looks_like_impersonate_missing(err_lower):
+                _disable_impersonate(last_err_text[:160])
+                # Replay current attempt without impersonate (now permanently off).
+                idx -= 1
+                continue
             if cookiefile and _looks_like_cookie_failure(err_lower):
                 _demote_cookie(cookiefile, last_err_text[:120])
             if site == "instagram" and ("no video" in err_lower or "there is no video" in err_lower):
@@ -1746,6 +1773,10 @@ def download_media_with_fallback(
             last_err = e
             last_err_text = str(e)
             logger.warning(f"[{site}] Ошибка скачивания: {e}")
+            if _looks_like_impersonate_missing(str(e)):
+                _disable_impersonate(str(e)[:160])
+                idx -= 1
+                continue
             if cookiefile and _looks_like_cookie_failure(str(e)):
                 _demote_cookie(cookiefile, str(e)[:120])
 
@@ -2507,6 +2538,8 @@ def download_audio_with_fallback(source: str, tmp_dir: Path) -> dict[str, Any]:
             last_err = e
             last_err_text = str(e)
             logger.warning("[music:%s] yt-dlp DownloadError: %s", site, e)
+            if _looks_like_impersonate_missing(last_err_text):
+                _disable_impersonate(last_err_text[:160])
         except UserFacingDownloadError as e:
             last_err = e
             last_err_text = str(e)
@@ -2515,6 +2548,8 @@ def download_audio_with_fallback(source: str, tmp_dir: Path) -> dict[str, Any]:
             last_err = e
             last_err_text = str(e)
             logger.warning("[music:%s] Ошибка скачивания: %s", site, e)
+            if _looks_like_impersonate_missing(str(e)):
+                _disable_impersonate(str(e)[:160])
 
     if isinstance(last_err, UserFacingDownloadError):
         raise last_err
