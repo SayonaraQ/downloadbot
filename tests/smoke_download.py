@@ -36,7 +36,9 @@ log = logging.getLogger("smoke")
 
 
 def _pick_ig_cookie() -> str | None:
-    """Pick the most-recently-touched Instagram cookies file from IG_COOKIES_DIR."""
+    """Pick the newest Instagram cookies file from IG_COOKIES_DIR and copy it to a
+    writable tmp path — yt-dlp rewrites the cookies file mid-request, which fails
+    on a read-only bind-mount."""
     cookies_dir = os.environ.get("IG_COOKIES_DIR")
     if not cookies_dir:
         return None
@@ -52,8 +54,15 @@ def _pick_ig_cookie() -> str | None:
     if not files:
         log.warning("IG_COOKIES_DIR=%s has no user_*.txt cookies", cookies_dir)
         return None
-    log.info("Using IG cookies: %s", files[0])
-    return str(files[0])
+    src = files[0]
+    dst = Path(tempfile.gettempdir()) / f"smoke_ig_cookie_{os.getpid()}.txt"
+    try:
+        shutil.copy2(src, dst)
+    except OSError as e:
+        log.warning("Could not copy IG cookie to writable tmp: %s", e)
+        return None
+    log.info("Using IG cookies (copied from %s to %s)", src.name, dst)
+    return str(dst)
 
 
 IG_COOKIE_FILE = _pick_ig_cookie()
