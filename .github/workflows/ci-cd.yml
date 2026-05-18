@@ -2,7 +2,7 @@ name: CI/CD
 
 on:
   push:
-    branches: [dev, main]
+    branches: [dev]
   workflow_dispatch:
 
 concurrency:
@@ -27,8 +27,6 @@ jobs:
           if ! docker image inspect "$SMOKE_IMAGE" > /dev/null 2>&1; then
             docker build -t "$SMOKE_IMAGE" -f tests/smoke-runner.Dockerfile tests/
           fi
-          # Ensure latest yt-dlp inside (cheap layer rebuild if stale)
-          docker run --rm "$SMOKE_IMAGE" pip install --quiet --upgrade yt-dlp >/dev/null 2>&1 || true
 
       - name: Run smoke tests in container
         run: |
@@ -40,14 +38,36 @@ jobs:
             "$SMOKE_IMAGE" \
             python /work/tests/smoke_download.py
 
+  promote:
+    name: Promote dev → main
+    needs: smoke
+    if: github.ref == 'refs/heads/dev' && needs.smoke.result == 'success'
+    runs-on: self-hosted
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fast-forward main to dev
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git push origin HEAD:main
+
   deploy:
     name: Deploy to prod
-    needs: smoke
-    if: github.ref == 'refs/heads/main' && needs.smoke.result == 'success'
+    needs: promote
+    if: needs.promote.result == 'success'
     runs-on: self-hosted
     timeout-minutes: 15
     steps:
-      - name: Pull latest main
+      - name: Pull latest main into bot dir
         run: |
           set -e
           cd "$BOT_DIR"
@@ -79,7 +99,7 @@ jobs:
 
   notify:
     name: Telegram notify
-    needs: [smoke, deploy]
+    needs: [smoke, promote, deploy]
     if: always()
     runs-on: self-hosted
     steps:
@@ -88,6 +108,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
           SMOKE:        ${{ needs.smoke.result }}
+          PROMOTE:      ${{ needs.promote.result }}
           DEPLOY:       ${{ needs.deploy.result }}
           REF:          ${{ github.ref_name }}
           SHA:          ${{ github.sha }}
@@ -111,10 +132,13 @@ jobs:
           if [ "$SMOKE" != "success" ]; then
             EMOJI="❌"
             STATUS="Smoke FAILED"
-          elif [ "$REF" = "main" ] && [ "$DEPLOY" = "success" ]; then
+          elif [ "$PROMOTE" != "success" ] && [ "$PROMOTE" != "skipped" ]; then
+            EMOJI="❌"
+            STATUS="Promote FAILED"
+          elif [ "$DEPLOY" = "success" ]; then
             EMOJI="✅"
             STATUS="Deploy OK"
-          elif [ "$REF" = "main" ] && [ "$DEPLOY" != "success" ] && [ "$DEPLOY" != "skipped" ]; then
+          elif [ "$DEPLOY" != "success" ] && [ "$DEPLOY" != "skipped" ]; then
             EMOJI="❌"
             STATUS="Deploy FAILED"
           else
