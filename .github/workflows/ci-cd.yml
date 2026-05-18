@@ -12,6 +12,8 @@ concurrency:
 env:
   BOT_DIR: /opt/myprojects/downloadbot
   SMOKE_IMAGE: smoke-runner:latest
+  # Opt into Node.js 24 runtime for JavaScript actions (Node 20 deprecated Jun 2026)
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   smoke:
