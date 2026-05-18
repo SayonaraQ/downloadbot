@@ -1,0 +1,134 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BOT_DIR: /opt/myprojects/downloadbot
+  SMOKE_IMAGE: smoke-runner:latest
+
+jobs:
+  smoke:
+    name: Smoke tests
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build smoke-runner image (cached after first run)
+        run: |
+          set -e
+          if ! docker image inspect "$SMOKE_IMAGE" > /dev/null 2>&1; then
+            docker build -t "$SMOKE_IMAGE" -f tests/smoke-runner.Dockerfile tests/
+          fi
+          # Ensure latest yt-dlp inside (cheap layer rebuild if stale)
+          docker run --rm "$SMOKE_IMAGE" pip install --quiet --upgrade yt-dlp >/dev/null 2>&1 || true
+
+      - name: Run smoke tests in container
+        run: |
+          set -e
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work:ro" \
+            -v "$BOT_DIR/data/ig_user_cookies:/cookies:ro" \
+            -e IG_COOKIES_DIR=/cookies \
+            "$SMOKE_IMAGE" \
+            python /work/tests/smoke_download.py
+
+  deploy:
+    name: Deploy to prod
+    needs: smoke
+    if: github.ref == 'refs/heads/main' && needs.smoke.result == 'success'
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - name: Pull latest main
+        run: |
+          set -e
+          cd "$BOT_DIR"
+          git fetch origin --prune
+          git reset --hard origin/main
+
+      - name: Build & restart container
+        run: |
+          set -e
+          cd "$BOT_DIR"
+          docker compose build downloadbot
+          docker compose up -d downloadbot
+
+      - name: Healthcheck
+        run: |
+          set -e
+          cd "$BOT_DIR"
+          sleep 8
+          state=$(docker compose ps --format '{{.State}}' downloadbot)
+          echo "Container state: $state"
+          echo "$state" | grep -q "running" || { docker compose logs --tail=120 downloadbot; exit 1; }
+          recent=$(docker compose logs --since 60s --no-color downloadbot 2>&1 || true)
+          if echo "$recent" | grep -iE "Traceback|CRITICAL|SystemExit|Config validation failed"; then
+            echo "Bad startup logs:"
+            echo "$recent" | tail -80
+            exit 1
+          fi
+          echo "Healthcheck OK"
+
+  notify:
+    name: Telegram notify
+    needs: [smoke, deploy]
+    if: always()
+    runs-on: self-hosted
+    steps:
+      - name: Compose and send message
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
+          SMOKE:        ${{ needs.smoke.result }}
+          DEPLOY:       ${{ needs.deploy.result }}
+          REF:          ${{ github.ref_name }}
+          SHA:          ${{ github.sha }}
+          AUTHOR:       ${{ github.actor }}
+          MSG_TITLE:    ${{ github.event.head_commit.message }}
+          REPO:         ${{ github.repository }}
+          RUN_ID:       ${{ github.run_id }}
+          SERVER_URL:   ${{ github.server_url }}
+        run: |
+          set -e
+
+          if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+            echo "TG_* secrets not set, skipping notify"
+            exit 0
+          fi
+
+          SHORT_SHA="${SHA:0:7}"
+          RUN_URL="${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}"
+          FIRST_LINE=$(printf '%s' "$MSG_TITLE" | head -n1)
+
+          if [ "$SMOKE" != "success" ]; then
+            EMOJI="❌"
+            STATUS="Smoke FAILED"
+          elif [ "$REF" = "main" ] && [ "$DEPLOY" = "success" ]; then
+            EMOJI="✅"
+            STATUS="Deploy OK"
+          elif [ "$REF" = "main" ] && [ "$DEPLOY" != "success" ] && [ "$DEPLOY" != "skipped" ]; then
+            EMOJI="❌"
+            STATUS="Deploy FAILED"
+          else
+            EMOJI="✅"
+            STATUS="Smoke OK ($REF)"
+          fi
+
+          TEXT=$(printf '<b>%s %s</b>\n<b>Branch:</b> <code>%s</code>\n<b>Commit:</b> <code>%s</code> — %s\n<b>By:</b> %s\n<a href="%s">Run details</a>' \
+            "$EMOJI" "$STATUS" "$REF" "$SHORT_SHA" "$FIRST_LINE" "$AUTHOR" "$RUN_URL")
+
+          curl -sS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "disable_web_page_preview=true" \
+            --data-urlencode "text=${TEXT}" > /tmp/tg_resp.json
+          cat /tmp/tg_resp.json
+          grep -q '"ok":true' /tmp/tg_resp.json
