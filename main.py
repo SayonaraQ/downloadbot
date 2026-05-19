@@ -84,6 +84,7 @@ except ImportError:
 
 # Runtime flag — flipped to False if downloads fail with "Impersonate target ... is not available".
 _impersonate_disabled = threading.Event()
+_ytdlp_default_extra_checked = threading.Event()
 
 
 def _disable_impersonate(reason: str) -> None:
@@ -754,16 +755,36 @@ def _latest_ytdlp_version() -> str | None:
 
 
 def auto_update_ytdlp(force: bool = False) -> None:
-    """Update yt-dlp via pip only when PyPI shows a newer version. Called at startup and periodically."""
+    """Update yt-dlp and ensure its default extra deps are installed."""
     try:
         current = _current_ytdlp_version()
         latest = _latest_ytdlp_version()
-        if not force and current and latest and current == latest:
+        needs_version_update = force or not current or (latest is not None and current != latest)
+        needs_default_extra = IMPERSONATE_ENABLED and not _ytdlp_default_extra_checked.is_set()
+        if not needs_version_update and not needs_default_extra:
             logger.info("yt-dlp актуален: %s", current)
             return
-        logger.info("Обновляю yt-dlp: %s → %s", current or "?", latest or "?")
+        if latest is None and current and not needs_default_extra and not force:
+            logger.info("Не удалось проверить новую версию yt-dlp; обновление пропущено")
+            return
+        if needs_default_extra and not needs_version_update:
+            logger.info("Проверяю default extra для yt-dlp %s", current or "?")
+        else:
+            logger.info("Обновляю yt-dlp: %s → %s", current or "?", latest or "?")
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
+            # `[default]` extra pins curl_cffi to a yt-dlp-compatible version,
+            # which is what enables browser impersonation for IG/TikTok.
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "-U",
+                "--upgrade-strategy",
+                "eager",
+                "yt-dlp[default]",
+            ],
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -771,10 +792,15 @@ def auto_update_ytdlp(force: bool = False) -> None:
             timeout=300,
         )
         out = (result.stdout or "") + (result.stderr or "")
-        if "Successfully installed" in out:
-            logger.info("yt-dlp обновлён")
-        elif "Requirement already satisfied" in out:
-            logger.info("yt-dlp уже актуален")
+        if result.returncode == 0:
+            _ytdlp_default_extra_checked.set()
+            if _impersonate_disabled.is_set():
+                _impersonate_disabled.clear()
+                logger.info("Impersonate снова включён после обновления yt-dlp extras")
+        if result.returncode == 0 and "Successfully installed" in out:
+            logger.info("yt-dlp/default dependencies обновлены")
+        elif result.returncode == 0 and "Requirement already satisfied" in out:
+            logger.info("yt-dlp/default dependencies уже актуальны")
         else:
             logger.warning("yt-dlp update unclear: rc=%d", result.returncode)
         ffmpeg_path = shutil.which("ffmpeg")
@@ -1110,6 +1136,12 @@ def _video_format_fallback_for_site(site: str) -> str:
     if site == "instagram":
         return INSTAGRAM_VIDEO_FORMAT_FALLBACK
     return VIDEO_FORMAT_FALLBACK
+
+
+def _proxy_for_video_site(site: str) -> str | None:
+    if site == "youtube":
+        return YT_PROXY
+    return None
 
 
 _TRACKING_PARAM_PREFIXES = ("utm_", "fbclid", "gclid", "ref", "src", "from", "share", "_branch_match_id", "si", "_r")
@@ -1868,12 +1900,19 @@ def _check_duration_limit(info: Any) -> None:
             )
 
 
-def _download_media_with_cookie(url: str, workdir: Path, *, cookiefile: str | None, site: str) -> dict[str, Any]:
+def _download_media_with_cookie(
+    url: str,
+    workdir: Path,
+    *,
+    cookiefile: str | None,
+    site: str,
+    proxy: str | None = None,
+) -> dict[str, Any]:
     """Download url into workdir; return cache entry-like dict with files list."""
 
     outtmpl = str(workdir / "%(id)s_%(playlist_index)s.%(ext)s")
     def _build_opts(fmt: str) -> dict[str, Any]:
-        opts = _ytdlp_common_opts(outtmpl=outtmpl, cookiefile=cookiefile, site=site)
+        opts = _ytdlp_common_opts(outtmpl=outtmpl, cookiefile=cookiefile, proxy=proxy, site=site)
         if site == "instagram":
             opts["noplaylist"] = False
             opts["playlistend"] = max(1, min(MAX_ITEMS_PER_LINK, 50))
@@ -1962,14 +2001,18 @@ def download_media_with_fallback(
 ) -> dict[str, Any]:
     """Try to download using no cookies (optional) and then multiple cookie files."""
     cookie_files = _cookie_files_for_site(site, preferred_user_id=preferred_user_id)
-    attempts = _ordered_download_attempts(site, cookie_files)
+    cookie_attempts = _ordered_download_attempts(site, cookie_files)
+    site_proxy = _proxy_for_video_site(site)
+    attempts: list[tuple[str | None, str | None]] = [(cookiefile, None) for cookiefile in cookie_attempts]
+    if site_proxy:
+        attempts += [(cookiefile, site_proxy) for cookiefile in cookie_attempts]
 
     last_err: Exception | None = None
     last_err_text: str | None = None
 
     idx = 0
     while idx < len(attempts):
-        cookiefile = attempts[idx]
+        cookiefile, proxy = attempts[idx]
         idx += 1
         # Ensure temp directory is clean between attempts
         try:
@@ -1982,9 +2025,20 @@ def download_media_with_fallback(
             pass
         try:
             logger.info(
-                f"[{site}] Попытка {idx}/{len(attempts)} скачать URL. cookies={'нет' if not cookiefile else cookiefile}"
+                "[%s] Попытка %d/%d скачать URL. cookies=%s proxy=%s",
+                site,
+                idx,
+                len(attempts),
+                "нет" if not cookiefile else cookiefile,
+                "да" if proxy else "нет",
             )
-            result = _download_media_with_cookie(url, tmp_dir, cookiefile=cookiefile, site=site)
+            result = _download_media_with_cookie(
+                url,
+                tmp_dir,
+                cookiefile=cookiefile,
+                site=site,
+                proxy=proxy,
+            )
             _remember_successful_cookie(site, cookiefile)
             return result
         except DownloadError as e:

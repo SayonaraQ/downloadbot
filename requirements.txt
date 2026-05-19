@@ -1,6 +1,5 @@
 python-telegram-bot[job-queue,webhooks]==22.7
-yt-dlp
-curl_cffi>=0.7
+yt-dlp[default]
 python-dotenv==1.0.1
 requests[socks]==2.32.3
 yandex-music==3.0.0

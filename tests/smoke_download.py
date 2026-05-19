@@ -26,6 +26,11 @@ except ModuleNotFoundError:
 
 from yt_dlp import YoutubeDL
 
+try:
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+except ImportError:
+    ImpersonateTarget = None  # type: ignore
+
 
 PER_TEST_TIMEOUT_SEC = 25
 MAX_FILE_BYTES = 50 * 1024 * 1024  # cap to keep CI fast
@@ -124,6 +129,8 @@ def _test_video(name: str, url: str, workdir: Path) -> str:
     opts = _common_opts(workdir)
     if name == "instagram_reel" and IG_COOKIE_FILE:
         opts["cookiefile"] = IG_COOKIE_FILE
+    if name in {"instagram_reel", "tiktok"} and ImpersonateTarget is not None:
+        opts["impersonate"] = ImpersonateTarget.from_str(os.environ.get("IMPERSONATE_TARGET", "chrome"))
     with YoutubeDL(opts) as ydl:
         ydl.download([url])
     largest = _largest_file(workdir)
