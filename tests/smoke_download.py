@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+from importlib import metadata
 from pathlib import Path
 
 # Allow running both `python tests/smoke_download.py` and `python -m tests.smoke_download`
@@ -25,6 +26,7 @@ except ModuleNotFoundError:
     from tests.smoke_urls import VIDEO_URLS, MUSIC_QUERY  # type: ignore
 
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import YoutubeDLError
 
 try:
     from yt_dlp.networking.impersonate import ImpersonateTarget
@@ -38,6 +40,18 @@ MIN_OK_BYTES = 50 * 1024            # >= 50 KB to count as real download
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("smoke")
+
+
+def _pkg_version(pkg: str) -> str:
+    try:
+        return metadata.version(pkg)
+    except metadata.PackageNotFoundError:
+        return "missing"
+
+
+def _looks_like_impersonate_missing(err_text: str) -> bool:
+    low = err_text.lower()
+    return "impersonate target" in low and "is not available" in low
 
 
 def _pick_ig_cookie() -> str | None:
@@ -131,8 +145,16 @@ def _test_video(name: str, url: str, workdir: Path) -> str:
         opts["cookiefile"] = IG_COOKIE_FILE
     if name in {"instagram_reel", "tiktok"} and ImpersonateTarget is not None:
         opts["impersonate"] = ImpersonateTarget.from_str(os.environ.get("IMPERSONATE_TARGET", "chrome"))
-    with YoutubeDL(opts) as ydl:
-        ydl.download([url])
+    try:
+        with YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except YoutubeDLError as e:
+        if "impersonate" not in opts or not _looks_like_impersonate_missing(str(e)):
+            raise
+        log.warning("[%s] impersonate unavailable, retrying without it: %s", name, str(e)[:160])
+        opts.pop("impersonate", None)
+        with YoutubeDL(opts) as ydl:
+            ydl.download([url])
     largest = _largest_file(workdir)
     if largest is None:
         raise RuntimeError("no output file")
@@ -172,6 +194,7 @@ def _run_case(name: str, fn) -> tuple[bool, str, float]:
 
 
 def main() -> int:
+    log.info("yt-dlp=%s curl_cffi=%s", _pkg_version("yt-dlp"), _pkg_version("curl_cffi"))
     base = Path(tempfile.mkdtemp(prefix="smoke_"))
     log.info("Smoke workdir: %s (timeout=%ds per case)", base, PER_TEST_TIMEOUT_SEC)
 
