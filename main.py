@@ -185,7 +185,7 @@ _LOW_VIDEO_FORMAT_FALLBACK = (
     "best[height<=480][vcodec!=none]/"
     "worst[vcodec!=none]"
 )
-_DEFAULT_INSTAGRAM_VIDEO_FORMAT = f"best[ext=mp4]/{_DEFAULT_VIDEO_FORMAT}"
+_DEFAULT_INSTAGRAM_VIDEO_FORMAT = "best[ext=mp4]/best"
 
 
 class Settings(BaseSettings):
@@ -1149,11 +1149,17 @@ def _video_format_fallback_for_site(site: str) -> str:
 
 
 def _video_format_candidates_for_site(site: str) -> list[str]:
-    candidates = [
-        _video_format_for_site(site),
-        _video_format_fallback_for_site(site),
-        _LOW_VIDEO_FORMAT_FALLBACK,
-    ]
+    if site == "instagram":
+        candidates = [
+            _video_format_for_site(site),
+            "best[ext=mp4]/best",
+        ]
+    else:
+        candidates = [
+            _video_format_for_site(site),
+            _video_format_fallback_for_site(site),
+            _LOW_VIDEO_FORMAT_FALLBACK,
+        ]
 
     out: list[str] = []
     seen: set[str] = set()
