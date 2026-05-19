@@ -1886,7 +1886,10 @@ def _ytdlp_common_opts(
 def _iter_entries(info: Any) -> Iterable[dict[str, Any]]:
     if isinstance(info, dict) and info.get("entries"):
         entries = info["entries"]
-        # yt-dlp may return a generator
+        # yt-dlp may return a one-shot generator; keep it reusable for download.
+        if not isinstance(entries, list):
+            entries = list(entries or [])
+            info["entries"] = entries
         for e in entries:
             if e:
                 yield e
@@ -1997,7 +2000,12 @@ def _download_media_with_cookie(
         try:
             download_opts = _build_opts(fmt)
             with YoutubeDL(download_opts) as ydl:
-                ydl.download(targets)
+                if site == "instagram":
+                    ydl.process_ie_result(selected_info, download=True)
+                else:
+                    rc = ydl.download(targets)
+                    if rc:
+                        raise DownloadError(f"yt-dlp завершился с кодом {rc}")
         except DownloadError as e:
             format_errors.append(str(e))
             if fmt_idx < len(formats):
