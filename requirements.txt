@@ -1,4 +1,4 @@
-python-telegram-bot[job-queue]==22.7
+python-telegram-bot[job-queue,webhooks]==22.7
 yt-dlp
 curl_cffi>=0.7
 python-dotenv==1.0.1

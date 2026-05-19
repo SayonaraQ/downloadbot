@@ -20,8 +20,11 @@ services:
 
     # Prometheus metrics endpoint. Bound to host loopback only — vmagent on the
     # host scrapes 127.0.0.1:9102/metrics, port is not reachable externally.
+    # Webhook port bound to host NetBird IP so nginx-edge on the same host can
+    # reverse-proxy from https://dwbt.null-core.com to the bot via wt0.
     ports:
       - "127.0.0.1:9102:9102"
+      - "100.76.73.31:8080:8080"
 
     restart: unless-stopped
     init: true
