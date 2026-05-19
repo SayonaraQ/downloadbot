@@ -7,3 +7,4 @@ yandex-music==3.0.0
 soundcloud-v2==1.7.0
 pydantic==2.9.2
 pydantic-settings==2.6.1
+prometheus_client>=0.20.0

@@ -227,6 +227,12 @@ class Settings(BaseSettings):
     # Liveness heartbeat (touched by JobQueue; consumed by docker healthcheck)
     heartbeat_interval_sec: int = Field(default=30, ge=5)
 
+    # Prometheus metrics endpoint
+    metrics_enabled: bool = True
+    metrics_addr: str = "0.0.0.0"
+    metrics_port: int = Field(default=9102, ge=1, le=65535)
+    metrics_refresh_sec: int = Field(default=30, ge=5)
+
     # Network
     ru_proxy: str = ""
     yt_proxy: str = ""
@@ -398,6 +404,135 @@ SC_COOKIES_FILES = _nz(settings.sc_cookies_files)
 sema = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 ios_transcode_sema = threading.Semaphore(IOS_TRANSCODE_MAX_PARALLEL)
 
+
+# -------------------------
+# Prometheus metrics
+# -------------------------
+METRICS_ENABLED = settings.metrics_enabled
+METRICS_ADDR = settings.metrics_addr
+METRICS_PORT = settings.metrics_port
+METRICS_REFRESH_SEC = max(5, settings.metrics_refresh_sec)
+
+try:
+    from prometheus_client import Counter, Gauge, Histogram, start_http_server
+    _PROM_AVAILABLE = True
+except ImportError:
+    _PROM_AVAILABLE = False
+    logger.warning("prometheus_client не установлен — метрики отключены")
+
+if _PROM_AVAILABLE:
+    M_DOWNLOADS = Counter(
+        "downloadbot_downloads_total",
+        "Download attempts grouped by site/kind/result",
+        labelnames=("site", "kind", "result"),
+    )
+    M_DOWNLOAD_LATENCY = Histogram(
+        "downloadbot_download_seconds",
+        "Wall-clock duration of one download (cache miss path)",
+        labelnames=("site", "kind"),
+        buckets=(0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600),
+    )
+    M_CACHE_EVENTS = Counter(
+        "downloadbot_cache_events_total",
+        "Cache hits and misses",
+        labelnames=("kind", "event"),
+    )
+    M_COOKIE_DEMOTIONS = Counter(
+        "downloadbot_cookie_demotions_total",
+        "Cookies marked unhealthy after a login_required / rate-limit error",
+    )
+    M_RATE_LIMIT_REJECTS = Counter(
+        "downloadbot_rate_limit_rejects_total",
+        "Requests rejected by the sliding-window limiter",
+        labelnames=("scope",),
+    )
+    M_BAN_DROPS = Counter(
+        "downloadbot_ban_drops_total",
+        "Updates silently dropped by the ban-gate handler",
+    )
+    M_INLINE_QUERIES = Counter(
+        "downloadbot_inline_queries_total",
+        "Inline-query results served, grouped by outcome",
+        labelnames=("result",),
+    )
+    M_SEMA_IN_USE = Gauge(
+        "downloadbot_sema_in_use",
+        "Active download workers (semaphore permits acquired)",
+    )
+    M_UNHEALTHY_COOKIES = Gauge(
+        "downloadbot_unhealthy_cookies",
+        "Currently demoted cookies",
+    )
+    M_CACHE_ENTRIES = Gauge(
+        "downloadbot_cache_entries",
+        "Cached download entries on disk",
+        labelnames=("kind",),
+    )
+    M_CACHE_BYTES = Gauge(
+        "downloadbot_cache_bytes",
+        "Cache disk usage in bytes",
+    )
+    M_USERS_TOTAL = Gauge(
+        "downloadbot_users_total",
+        "Distinct users seen by the bot",
+    )
+    M_BANNED_USERS = Gauge(
+        "downloadbot_banned_users",
+        "Currently banned users",
+    )
+
+
+def _metrics_inc(metric_name: str, labels: dict[str, str] | None = None, value: float = 1.0) -> None:
+    """Best-effort metric increment. Silently no-ops if metrics disabled."""
+    if not _PROM_AVAILABLE:
+        return
+    metric = globals().get(metric_name)
+    if metric is None:
+        return
+    try:
+        if labels:
+            metric.labels(**labels).inc(value)
+        else:
+            metric.inc(value)
+    except Exception as e:
+        logger.debug("metric %s inc failed: %s", metric_name, e)
+
+
+def _metrics_observe(metric_name: str, value: float, labels: dict[str, str] | None = None) -> None:
+    if not _PROM_AVAILABLE:
+        return
+    metric = globals().get(metric_name)
+    if metric is None:
+        return
+    try:
+        if labels:
+            metric.labels(**labels).observe(value)
+        else:
+            metric.observe(value)
+    except Exception as e:
+        logger.debug("metric %s observe failed: %s", metric_name, e)
+
+
+def _metrics_set(metric_name: str, value: float, labels: dict[str, str] | None = None) -> None:
+    if not _PROM_AVAILABLE:
+        return
+    metric = globals().get(metric_name)
+    if metric is None:
+        return
+    try:
+        if labels:
+            metric.labels(**labels).set(value)
+        else:
+            metric.set(value)
+    except Exception as e:
+        logger.debug("metric %s set failed: %s", metric_name, e)
+
+
+def _sema_in_use() -> int:
+    # asyncio.Semaphore._value = remaining permits. _value < 0 means waiters queued.
+    val = getattr(sema, "_value", MAX_CONCURRENT_DOWNLOADS)
+    return max(0, MAX_CONCURRENT_DOWNLOADS - int(val))
+
 # Per-user + per-chat rate limiting (sliding windows)
 RATE_LIMIT_PER_USER = max(0, settings.rate_limit_per_user)
 RATE_LIMIT_WINDOW_SEC = max(1, settings.rate_limit_window_sec)
@@ -419,6 +554,7 @@ def _check_rate_limit(user_id: int | None, chat_id: int | None = None) -> tuple[
         user_bucket = _user_request_log.setdefault(user_id, [])
         user_bucket[:] = [t for t in user_bucket if t > window_start]
         if len(user_bucket) >= RATE_LIMIT_PER_USER:
+            _metrics_inc("M_RATE_LIMIT_REJECTS", {"scope": "user"})
             return False, max(1.0, user_bucket[0] + RATE_LIMIT_WINDOW_SEC - now)
 
     chat_bucket: list[float] | None = None
@@ -427,6 +563,7 @@ def _check_rate_limit(user_id: int | None, chat_id: int | None = None) -> tuple[
         chat_bucket = _chat_request_log.setdefault(chat_id, [])
         chat_bucket[:] = [t for t in chat_bucket if t > window_start]
         if len(chat_bucket) >= RATE_LIMIT_PER_CHAT:
+            _metrics_inc("M_RATE_LIMIT_REJECTS", {"scope": "chat"})
             return False, max(1.0, chat_bucket[0] + RATE_LIMIT_WINDOW_CHAT_SEC - now)
 
     if user_bucket is not None:
@@ -450,6 +587,7 @@ def _cache_count(kind: str, hit: bool) -> None:
     bucket = f"{kind}_{'hit' if hit else 'miss'}"
     with _cache_stats_lock:
         _cache_stats_counter[bucket] = _cache_stats_counter.get(bucket, 0) + 1
+    _metrics_inc("M_CACHE_EVENTS", {"kind": kind, "event": "hit" if hit else "miss"})
 
 
 def _cache_counter_snapshot() -> dict[str, int]:
@@ -484,6 +622,7 @@ def _demote_cookie(cookiefile: str | None, reason: str) -> None:
     with _unhealthy_cookies_lock:
         _unhealthy_cookies[cookiefile] = time.time() + IG_COOKIE_DEMOTE_SEC
     logger.warning("Cookie демотирован на %dч: %s — %s", IG_COOKIE_DEMOTE_SEC // 3600, cookiefile, reason)
+    _metrics_inc("M_COOKIE_DEMOTIONS")
 
 
 _LOGIN_REQUIRED_PATTERNS = (
@@ -2666,6 +2805,7 @@ async def _get_or_download_audio_entry(
     del requester_id  # reserved for future per-user music cookies
     source_key = _audio_cache_key_source(source)
     key = _cache_key(f"audio:{source_key}")
+    metric_site = _audio_site_for_url(source) if _looks_like_url(source) else "youtube_search"
 
     entry = _cache_index.get(key)
     if entry and _cache_entry_is_usable(entry):
@@ -2683,6 +2823,7 @@ async def _get_or_download_audio_entry(
         tmp_dir = Path("/tmp") / f"music_{key[:12]}_{uuid.uuid4().hex[:8]}"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
+        dl_started = time.time()
         try:
             result = await asyncio.to_thread(download_audio_with_fallback, source, tmp_dir)
             files = [Path(p) for p in result["files"]]
@@ -2717,9 +2858,12 @@ async def _get_or_download_audio_entry(
                 "items": items,
             }
             _write_cache_entry(entry)
+            _metrics_inc("M_DOWNLOADS", {"site": entry["site"], "kind": "audio", "result": "success"})
+            _metrics_observe("M_DOWNLOAD_LATENCY", time.time() - dl_started, {"site": entry["site"], "kind": "audio"})
             return entry
         except Exception:
             _purge_cache_entry(key)
+            _metrics_inc("M_DOWNLOADS", {"site": metric_site, "kind": "audio", "result": "failure"})
             raise
         finally:
             try:
@@ -3172,6 +3316,7 @@ async def ban_gate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     user = update.effective_user
     if not user or not is_banned(user.id):
         return
+    _metrics_inc("M_BAN_DROPS")
     # Silently drop further handlers. Avoid replying so admins can't be DoS-pinged
     # by a banned user repeatedly triggering a ban-notice.
     raise ApplicationHandlerStop
@@ -3189,6 +3334,39 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         os.utime(HEARTBEAT_PATH, None)
     except Exception as e:
         logger.warning("Heartbeat touch failed: %s", e)
+
+
+async def metrics_refresh_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Refresh slow / state-derived gauges. Counters/histograms updated inline."""
+    if not _PROM_AVAILABLE:
+        return
+    try:
+        _metrics_set("M_SEMA_IN_USE", float(_sema_in_use()))
+        with _unhealthy_cookies_lock:
+            unhealthy_now = sum(1 for ts in _unhealthy_cookies.values() if ts > time.time())
+        _metrics_set("M_UNHEALTHY_COOKIES", float(unhealthy_now))
+        with _banned_users_cache_lock:
+            banned_now = len(_banned_users_cache)
+        _metrics_set("M_BANNED_USERS", float(banned_now))
+        _metrics_set("M_USERS_TOTAL", float(_users_count()))
+        stats = _collect_cache_stats()
+        _metrics_set("M_CACHE_ENTRIES", float(stats.get("audio", 0)), {"kind": "audio"})
+        _metrics_set("M_CACHE_ENTRIES", float(stats.get("video", 0)), {"kind": "media"})
+        _metrics_set("M_CACHE_BYTES", float(stats.get("size_mb", 0.0)) * 1024 * 1024)
+    except Exception as e:
+        logger.debug("metrics_refresh_job failed: %s", e)
+
+
+def _start_metrics_server() -> None:
+    """Boot prometheus_client HTTP exporter (background thread)."""
+    if not _PROM_AVAILABLE or not METRICS_ENABLED:
+        logger.info("Метрики отключены (METRICS_ENABLED=%s, prom=%s)", METRICS_ENABLED, _PROM_AVAILABLE)
+        return
+    try:
+        start_http_server(METRICS_PORT, addr=METRICS_ADDR)
+        logger.info("Prometheus metrics: %s:%d/metrics", METRICS_ADDR, METRICS_PORT)
+    except Exception as e:
+        logger.error("Не удалось запустить metrics endpoint: %s", e)
 
 
 async def pechenyuha_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3883,6 +4061,7 @@ async def _get_or_download_media_entry(
         tmp_dir = Path("/tmp") / f"dl_{key[:12]}_{uuid.uuid4().hex[:8]}"
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
+        dl_started = time.time()
         try:
             result = await asyncio.to_thread(
                 download_media_with_fallback,
@@ -3921,9 +4100,14 @@ async def _get_or_download_media_entry(
                 "items": items,
             }
             _write_cache_entry(entry)
+            kinds = {it.get("kind") for it in items if isinstance(it, dict)}
+            metric_kind = "audio" if "audio" in kinds and "video" not in kinds else "media"
+            _metrics_inc("M_DOWNLOADS", {"site": site, "kind": metric_kind, "result": "success"})
+            _metrics_observe("M_DOWNLOAD_LATENCY", time.time() - dl_started, {"site": site, "kind": metric_kind})
             return entry
         except Exception:
             _purge_cache_entry(key)
+            _metrics_inc("M_DOWNLOADS", {"site": site, "kind": "media", "result": "failure"})
             raise
         finally:
             try:
@@ -4436,8 +4620,11 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
     if inline_query is None:
         return
 
+    _metrics_inc("M_INLINE_QUERIES", {"result": "received"})
+
     text = inline_query.query.strip()
     if not text:
+        _metrics_inc("M_INLINE_QUERIES", {"result": "empty"})
         await inline_query.answer(
             [_inline_article("Вставь ссылку на видео или название песни", "Ссылка → скачаю видео. Название трека (или /music запрос) → найду и скачаю музыку.")],
             cache_time=1,
@@ -5265,6 +5452,13 @@ def build_application() -> Application:
             interval=HEARTBEAT_INTERVAL_SEC,
             first=1,
         )
+        # Periodic refresh of Prometheus gauges (cache size, banned count, etc).
+        if _PROM_AVAILABLE and METRICS_ENABLED:
+            app.job_queue.run_repeating(
+                metrics_refresh_job,
+                interval=METRICS_REFRESH_SEC,
+                first=METRICS_REFRESH_SEC,
+            )
 
     return app
 
@@ -5276,6 +5470,7 @@ def main() -> None:
     _banned_users_reload()
     _cache_db_init()
     _load_cache_index_from_disk()
+    _start_metrics_server()
     auto_update_ytdlp()
 
     application = build_application()

@@ -18,6 +18,11 @@ services:
       - ./data:/app/data
       - ./cookies:/app/cookies:ro
 
+    # Prometheus metrics endpoint. Bound to host loopback only — vmagent on the
+    # host scrapes 127.0.0.1:9102/metrics, port is not reachable externally.
+    ports:
+      - "127.0.0.1:9102:9102"
+
     restart: unless-stopped
     init: true
 
