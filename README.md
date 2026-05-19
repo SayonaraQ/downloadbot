@@ -236,12 +236,11 @@ WEBHOOK_SECRET_TOKEN=secret-token
 
 ```env
 YA_PROXY=socks5://user:pass@host:port
-YT_PROXY=socks5://user:pass@host:port
 RU_PROXY=socks5://user:pass@host:port
 YA_COOKIES_FILES=/app/cookies/yandex.txt
 ```
 
-`YA_PROXY` используется для Яндекс.Музыки, `YT_PROXY` - для YouTube-видео и YouTube-аудио. Если они не заданы, бот возьмет `RU_PROXY`. Это удобно, когда общий proxy нужен для сервисов с региональными ограничениями.
+`YA_PROXY` используется только для Яндекс.Музыки. Если он не задан, бот возьмет `RU_PROXY`. Это удобно, когда общий российский proxy нужен только для сервисов с региональными ограничениями.
 
 Если вместо proxy используется NetBird exit node `ru_all_exit_node`, маршрут должен быть настроен на уровне хоста или Docker-сети: контейнер должен видеть Яндекс.Музыку через этот маршрут. В таком варианте `YA_PROXY` можно не задавать. Если NetBird поднимает локальный SOCKS/HTTP proxy, укажите его в `YA_PROXY`, например `socks5://127.0.0.1:1080`.
 
