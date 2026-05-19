@@ -61,6 +61,7 @@ from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -220,6 +221,11 @@ class Settings(BaseSettings):
     # Rate limit
     rate_limit_per_user: int = 12
     rate_limit_window_sec: int = 600
+    rate_limit_per_chat: int = 30
+    rate_limit_window_chat_sec: int = 60
+
+    # Liveness heartbeat (touched by JobQueue; consumed by docker healthcheck)
+    heartbeat_interval_sec: int = Field(default=30, ge=5)
 
     # Network
     ru_proxy: str = ""
@@ -392,25 +398,41 @@ SC_COOKIES_FILES = _nz(settings.sc_cookies_files)
 sema = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 ios_transcode_sema = threading.Semaphore(IOS_TRANSCODE_MAX_PARALLEL)
 
-# Per-user rate limiting (sliding window)
+# Per-user + per-chat rate limiting (sliding windows)
 RATE_LIMIT_PER_USER = max(0, settings.rate_limit_per_user)
 RATE_LIMIT_WINDOW_SEC = max(1, settings.rate_limit_window_sec)
+RATE_LIMIT_PER_CHAT = max(0, settings.rate_limit_per_chat)
+RATE_LIMIT_WINDOW_CHAT_SEC = max(1, settings.rate_limit_window_chat_sec)
 _user_request_log: dict[int, list[float]] = {}
+_chat_request_log: dict[int, list[float]] = {}
 
 
-def _check_rate_limit(user_id: int | None) -> tuple[bool, float]:
-    """Sliding-window per-user limit. Returns (allowed, retry_after_sec)."""
-    if not user_id or RATE_LIMIT_PER_USER <= 0 or (ADMIN_ID and user_id == ADMIN_ID):
+def _check_rate_limit(user_id: int | None, chat_id: int | None = None) -> tuple[bool, float]:
+    """Sliding-window per-user + per-chat limit. Returns (allowed, retry_after_sec)."""
+    if ADMIN_ID and user_id == ADMIN_ID:
         return True, 0.0
     now = time.time()
-    window_start = now - RATE_LIMIT_WINDOW_SEC
-    bucket = _user_request_log.setdefault(user_id, [])
-    # prune
-    bucket[:] = [t for t in bucket if t > window_start]
-    if len(bucket) >= RATE_LIMIT_PER_USER:
-        retry_after = bucket[0] + RATE_LIMIT_WINDOW_SEC - now
-        return False, max(1.0, retry_after)
-    bucket.append(now)
+
+    user_bucket: list[float] | None = None
+    if user_id and RATE_LIMIT_PER_USER > 0:
+        window_start = now - RATE_LIMIT_WINDOW_SEC
+        user_bucket = _user_request_log.setdefault(user_id, [])
+        user_bucket[:] = [t for t in user_bucket if t > window_start]
+        if len(user_bucket) >= RATE_LIMIT_PER_USER:
+            return False, max(1.0, user_bucket[0] + RATE_LIMIT_WINDOW_SEC - now)
+
+    chat_bucket: list[float] | None = None
+    if chat_id and RATE_LIMIT_PER_CHAT > 0:
+        window_start = now - RATE_LIMIT_WINDOW_CHAT_SEC
+        chat_bucket = _chat_request_log.setdefault(chat_id, [])
+        chat_bucket[:] = [t for t in chat_bucket if t > window_start]
+        if len(chat_bucket) >= RATE_LIMIT_PER_CHAT:
+            return False, max(1.0, chat_bucket[0] + RATE_LIMIT_WINDOW_CHAT_SEC - now)
+
+    if user_bucket is not None:
+        user_bucket.append(now)
+    if chat_bucket is not None:
+        chat_bucket.append(now)
     return True, 0.0
 
 # Per-URL locks to avoid duplicate downloads
@@ -649,6 +671,12 @@ def _users_db_init() -> None:
                 last_seen   REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen);
+
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id     INTEGER PRIMARY KEY,
+                reason      TEXT,
+                banned_at   REAL NOT NULL
+            );
             """
         )
         # One-shot migration from users.txt
@@ -703,6 +731,73 @@ def _users_all_ids() -> list[int]:
     try:
         with _users_db_lock, _users_db_connect() as conn:
             return [int(r[0]) for r in conn.execute("SELECT chat_id FROM users ORDER BY chat_id").fetchall()]
+    except Exception:
+        return []
+
+
+# In-memory cache of banned user_ids, kept hot for the ban-gate handler.
+_banned_users_cache: set[int] = set()
+_banned_users_cache_lock = threading.Lock()
+
+
+def _banned_users_reload() -> None:
+    try:
+        with _users_db_lock, _users_db_connect() as conn:
+            ids = {int(r[0]) for r in conn.execute("SELECT user_id FROM banned_users").fetchall()}
+    except Exception as e:
+        logger.warning("Не удалось загрузить banned_users: %s", e)
+        return
+    with _banned_users_cache_lock:
+        _banned_users_cache.clear()
+        _banned_users_cache.update(ids)
+
+
+def is_banned(user_id: int | None) -> bool:
+    if not user_id:
+        return False
+    with _banned_users_cache_lock:
+        return user_id in _banned_users_cache
+
+
+def ban_user(user_id: int, reason: str | None = None) -> None:
+    try:
+        with _users_db_lock, _users_db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO banned_users(user_id, reason, banned_at) VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason
+                """,
+                (user_id, (reason or "").strip() or None, time.time()),
+            )
+    except Exception as e:
+        logger.error("Ошибка ban_user(%s): %s", user_id, e)
+        return
+    with _banned_users_cache_lock:
+        _banned_users_cache.add(user_id)
+
+
+def unban_user(user_id: int) -> bool:
+    try:
+        with _users_db_lock, _users_db_connect() as conn:
+            cur = conn.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+            removed = cur.rowcount > 0
+    except Exception as e:
+        logger.error("Ошибка unban_user(%s): %s", user_id, e)
+        return False
+    with _banned_users_cache_lock:
+        _banned_users_cache.discard(user_id)
+    return removed
+
+
+def list_banned() -> list[tuple[int, str | None, float]]:
+    try:
+        with _users_db_lock, _users_db_connect() as conn:
+            return [
+                (int(r[0]), r[1], float(r[2]))
+                for r in conn.execute(
+                    "SELECT user_id, reason, banned_at FROM banned_users ORDER BY banned_at DESC"
+                ).fetchall()
+            ]
     except Exception:
         return []
 
@@ -3010,6 +3105,92 @@ async def cookie_health_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("Не удалось отправить предупреждение об истечении cookies: %s", e)
 
 
+def _parse_ban_args(args: list[str]) -> tuple[int | None, str | None]:
+    if not args:
+        return None, None
+    try:
+        uid = int(args[0])
+    except ValueError:
+        return None, None
+    reason = " ".join(args[1:]).strip() or None
+    return uid, reason
+
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ADMIN_ID or not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    uid, reason = _parse_ban_args(context.args or [])
+    if uid is None:
+        await update.message.reply_text("Использование: /ban <user_id> [причина]")
+        return
+    if ADMIN_ID and uid == ADMIN_ID:
+        await update.message.reply_text("Нельзя забанить администратора.")
+        return
+    ban_user(uid, reason)
+    suffix = f" — {reason}" if reason else ""
+    await update.message.reply_text(f"🚫 Забанен `{uid}`{suffix}", parse_mode="Markdown")
+
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ADMIN_ID or not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Использование: /unban <user_id>")
+        return
+    try:
+        uid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+    if unban_user(uid):
+        await update.message.reply_text(f"✅ Разбанен `{uid}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"`{uid}` не был в бане.", parse_mode="Markdown")
+
+
+async def banlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ADMIN_ID or not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    rows = list_banned()
+    if not rows:
+        await update.message.reply_text("Бан-лист пуст.")
+        return
+    import datetime as _dt
+    lines = ["<b>🚫 Забанены:</b>"]
+    for uid, reason, banned_at in rows[:50]:
+        ts = _dt.datetime.fromtimestamp(banned_at, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M")
+        suffix = f" — {reason}" if reason else ""
+        lines.append(f"<code>{uid}</code> ({ts} UTC){suffix}")
+    if len(rows) > 50:
+        lines.append(f"\n…и ещё {len(rows) - 50}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def ban_gate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group=-2 pre-handler: drop all updates from banned users."""
+    user = update.effective_user
+    if not user or not is_banned(user.id):
+        return
+    # Silently drop further handlers. Avoid replying so admins can't be DoS-pinged
+    # by a banned user repeatedly triggering a ban-notice.
+    raise ApplicationHandlerStop
+
+
+HEARTBEAT_PATH = DATA_DIR / ".heartbeat"
+HEARTBEAT_INTERVAL_SEC = max(5, settings.heartbeat_interval_sec)
+
+
+async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Touch heartbeat file; docker healthcheck checks its mtime."""
+    try:
+        HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        HEARTBEAT_PATH.touch(exist_ok=True)
+        os.utime(HEARTBEAT_PATH, None)
+    except Exception as e:
+        logger.warning("Heartbeat touch failed: %s", e)
+
+
 async def pechenyuha_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None:
         return
@@ -3297,7 +3478,7 @@ async def music_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if task and not task.done():
             task.cancel()
 
-    allowed, retry_after = _check_rate_limit(requester_id)
+    allowed, retry_after = _check_rate_limit(requester_id, chat_id)
     if not allowed:
         await cq.edit_message_text(
             f"Слишком много запросов. Попробуй через {int(retry_after)} сек."
@@ -3403,7 +3584,7 @@ async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # URL → качаем напрямую
     if _looks_like_url(source):
-        allowed, retry_after = _check_rate_limit(requester_id)
+        allowed, retry_after = _check_rate_limit(requester_id, update.message.chat_id)
         if not allowed:
             await update.message.reply_text(
                 f"Слишком много запросов. Попробуй через {int(retry_after)} сек."
@@ -3580,7 +3761,7 @@ async def ytmusic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     requester_id = update.effective_user.id if update.effective_user else None
 
-    allowed, retry_after = _check_rate_limit(requester_id)
+    allowed, retry_after = _check_rate_limit(requester_id, update.message.chat_id)
     if not allowed:
         await update.message.reply_text(
             f"Слишком много запросов. Попробуй через {int(retry_after)} сек."
@@ -4538,7 +4719,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     music_source = _extract_inline_music_source(text)
     is_video = _looks_like_supported_video_url(text)
     if music_source or is_video:
-        allowed, retry_after = _check_rate_limit(requester_id)
+        allowed, retry_after = _check_rate_limit(requester_id, chat_id)
         if not allowed:
             await update.message.reply_text(
                 f"Слишком много запросов. Попробуй через {int(retry_after)} сек."
@@ -4974,9 +5155,32 @@ BOT_COMMANDS = [
 ]
 
 
-async def _set_bot_commands(app: Application) -> None:
+BOT_SHORT_DESCRIPTION = (
+    "Скачиваю видео и музыку из Instagram, TikTok, YouTube, VK, SoundCloud и Яндекс.Музыки."
+)
+
+BOT_DESCRIPTION = (
+    "Привет! Я скачиваю медиа по ссылкам и ищу музыку.\n\n"
+    "• Пришли ссылку — Instagram, TikTok, YouTube, VK, SoundCloud или Яндекс.Музыка.\n"
+    "• /music <ссылка или запрос> — скачать только аудио.\n"
+    "• Работаю в личке, группах и через inline: @bot_username <ссылка>.\n"
+    "• /pechenyuha — загрузить личные Instagram cookies для приватных Reels."
+)
+
+
+async def _set_bot_metadata(app: Application) -> None:
     await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllPrivateChats())
     await app.bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
+    # Description shown on bot profile / before /start, short_description as preview snippet.
+    # Telegram rejects identical updates; ignore BadRequest to keep startup resilient.
+    try:
+        await app.bot.set_my_description(BOT_DESCRIPTION)
+    except BadRequest as e:
+        logger.info("set_my_description skipped: %s", e)
+    try:
+        await app.bot.set_my_short_description(BOT_SHORT_DESCRIPTION)
+    except BadRequest as e:
+        logger.info("set_my_short_description skipped: %s", e)
 
 
 async def _post_stop(app: Application) -> None:
@@ -5011,15 +5215,21 @@ def build_application() -> Application:
         ApplicationBuilder()
         .token(TOKEN)
         .defaults(defaults)
-        .post_init(_set_bot_commands)
+        .post_init(_set_bot_metadata)
         .post_stop(_post_stop)
         .concurrent_updates(True)
         .build()
     )
 
+    # Ban gate runs before everything else: dropped updates never reach handlers.
+    app.add_handler(TypeHandler(Update, ban_gate_handler), group=-2)
+
     app.add_handler(CommandHandler("pechenyuha", pechenyuha_command))
     app.add_handler(CommandHandler("users", get_users_count))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("ban", ban_command))
+    app.add_handler(CommandHandler("unban", unban_command))
+    app.add_handler(CommandHandler("banlist", banlist_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CallbackQueryHandler(broadcast_callback, pattern=r"^bcast:"))
     app.add_handler(CommandHandler("start", start_command))
@@ -5049,6 +5259,12 @@ def build_application() -> Application:
             interval=YTDLP_UPDATE_INTERVAL_SEC,
             first=YTDLP_UPDATE_INTERVAL_SEC,
         )
+        # Liveness heartbeat for docker healthcheck
+        app.job_queue.run_repeating(
+            heartbeat_job,
+            interval=HEARTBEAT_INTERVAL_SEC,
+            first=1,
+        )
 
     return app
 
@@ -5057,6 +5273,7 @@ def main() -> None:
     _ensure_dirs()
     _cleanup_orphan_tmp_dirs()
     _users_db_init()
+    _banned_users_reload()
     _cache_db_init()
     _load_cache_index_from_disk()
     auto_update_ytdlp()

@@ -21,6 +21,16 @@ services:
     restart: unless-stopped
     init: true
 
+    # Liveness via heartbeat file touched by JobQueue every HEARTBEAT_INTERVAL_SEC.
+    # Container is unhealthy if the touch stalls (>90s by default) — covers
+    # stuck event loop, deadlock, lost Telegram polling.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os,sys,time; p=\"/app/data/.heartbeat\"; sys.exit(0 if os.path.exists(p) and (time.time()-os.path.getmtime(p))<90 else 1)'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
     # Чтобы логи не разрастались бесконечно
     logging:
       driver: "json-file"
