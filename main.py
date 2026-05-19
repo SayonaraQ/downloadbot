@@ -175,16 +175,6 @@ _DEFAULT_VIDEO_FORMAT = (
     "bv*+ba/best"
 )
 _DEFAULT_INSTAGRAM_VIDEO_FORMAT = f"best[ext=mp4]/{_DEFAULT_VIDEO_FORMAT}"
-# TikTok serves muxed progressive files. Prefer H.264 mp4 and explicitly skip
-# HEVC variants (codec ids hev1/hvc1) — HEVC mp4 from TikTok forces the ffmpeg
-# transcode path on iPhone-targeted output. avc1/h264 mp4 passes ffmpeg -c copy.
-_DEFAULT_TIKTOK_VIDEO_FORMAT = (
-    "best[vcodec^=avc1][ext=mp4]/"
-    "best[vcodec*=h264][ext=mp4]/"
-    "best[ext=mp4][vcodec!^=hev1][vcodec!^=hvc1]/"
-    "best[ext=mp4]/"
-    "best"
-)
 
 
 class Settings(BaseSettings):
@@ -275,10 +265,8 @@ class Settings(BaseSettings):
     # Video format
     video_format: str = _DEFAULT_VIDEO_FORMAT
     instagram_video_format: str = _DEFAULT_INSTAGRAM_VIDEO_FORMAT
-    tiktok_video_format: str = _DEFAULT_TIKTOK_VIDEO_FORMAT
     video_format_fallback: str = "bestvideo*+bestaudio/best"
     instagram_video_format_fallback: str = ""
-    tiktok_video_format_fallback: str = ""
     merge_output_format: str = "mp4"
 
     # iOS normalization
@@ -382,13 +370,10 @@ MUSIC_SESSION_TTL_SEC = settings.music_session_ttl_sec
 
 DEFAULT_VIDEO_FORMAT = _DEFAULT_VIDEO_FORMAT
 DEFAULT_INSTAGRAM_VIDEO_FORMAT = _DEFAULT_INSTAGRAM_VIDEO_FORMAT
-DEFAULT_TIKTOK_VIDEO_FORMAT = _DEFAULT_TIKTOK_VIDEO_FORMAT
 VIDEO_FORMAT = settings.video_format
 INSTAGRAM_VIDEO_FORMAT = settings.instagram_video_format
-TIKTOK_VIDEO_FORMAT = settings.tiktok_video_format
 VIDEO_FORMAT_FALLBACK = settings.video_format_fallback
 INSTAGRAM_VIDEO_FORMAT_FALLBACK = settings.instagram_video_format_fallback or VIDEO_FORMAT_FALLBACK
-TIKTOK_VIDEO_FORMAT_FALLBACK = settings.tiktok_video_format_fallback or VIDEO_FORMAT_FALLBACK
 MERGE_OUTPUT_FORMAT = settings.merge_output_format
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
@@ -1169,16 +1154,12 @@ def _remember_successful_cookie(site: str, cookiefile: str | None) -> None:
 def _video_format_for_site(site: str) -> str:
     if site == "instagram":
         return INSTAGRAM_VIDEO_FORMAT
-    if site == "tiktok":
-        return TIKTOK_VIDEO_FORMAT
     return VIDEO_FORMAT
 
 
 def _video_format_fallback_for_site(site: str) -> str:
     if site == "instagram":
         return INSTAGRAM_VIDEO_FORMAT_FALLBACK
-    if site == "tiktok":
-        return TIKTOK_VIDEO_FORMAT_FALLBACK
     return VIDEO_FORMAT_FALLBACK
 
 
