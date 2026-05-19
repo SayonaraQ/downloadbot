@@ -658,6 +658,32 @@ def _looks_like_cookie_failure(err_text: str) -> bool:
     low = err_text.lower()
     return any(p in low for p in _LOGIN_REQUIRED_PATTERNS)
 
+
+_UNAVAILABLE_HINTS = (
+    "404", "not found", "this video has been removed", "private",
+    "unavailable", "no longer available", "deleted",
+    "geo restrict", "blocked in your country", "regional",
+)
+
+
+def _user_friendly_download_error(err: BaseException, kind: str = "video") -> str:
+    """Map an internal exception to a non-leaking, user-readable message.
+
+    Internal details (cookies, tokens, paths, library tracebacks) never reach
+    the user — both for UX and to avoid hinting at infrastructure to attackers.
+    Cookie/login failures intentionally fall through to the generic message.
+    """
+    low = str(err).lower()
+    if "filesize" in low or "max_filesize" in low or "file is larger" in low:
+        return f"Файл больше {MAX_SIZE_MB} MB — Telegram такой не примет."
+    if any(k in low for k in _UNAVAILABLE_HINTS):
+        return "Источник недоступен — приватный, удалённый или закрытый по региону."
+    if "timeout" in low or "timed out" in low:
+        return "Источник не ответил вовремя. Попробуй позже."
+    if kind == "audio":
+        return "Не удалось загрузить, такое бывает, попробуйте другой трек."
+    return "Не удалось загрузить, такое бывает, попробуйте другое видео."
+
 # Inline cache warm-up tasks. Inline answers must be fast, so expensive downloads
 # are prepared in the background and served from Telegram file_id on the next query.
 _inline_prepare_tasks: dict[str, asyncio.Task] = {}
@@ -2594,10 +2620,11 @@ def _ensure_yandex_music_not_preview(files: list[Path], entries: list[dict[str, 
         return
 
     if shortest_download <= 45 and shortest_download < expected_duration * 0.5:
+        # Operator-visible reason is logged via the exception class name in upstream
+        # callers; user-facing text stays generic so we don't leak that the bot
+        # is missing Yandex.Music cookies.
         raise YandexMusicPreviewError(
-            "Яндекс.Музыка отдала только 30-секундный preview. "
-            "Для полного трека нужны cookies Яндекса от аккаунта с доступом к музыке "
-            "через YA_COOKIES_FILE или YA_COOKIES_FILES."
+            "Не удалось загрузить, попробуйте другой источник."
         )
 
 
@@ -2723,7 +2750,7 @@ def _download_yandex_music_api(url: str, workdir: Path) -> dict[str, Any]:
 
     track_id_m = re.search(r"/track/(\d+)", url)
     if not track_id_m:
-        raise ValueError(f"Не удалось извлечь ID трека из URL: {url}")
+        raise ValueError("Некорректная ссылка.")
     track_id = track_id_m.group(1)
 
     # album:track format may be needed; try plain track_id first
@@ -4980,9 +5007,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 await update.message.reply_text(str(e))
             except Exception as e:
                 logger.error(f"Ошибка: {e}")
-                await update.message.reply_text(
-                    "Не удалось загрузить. Возможно пора обновить cookies"
-                )
+                await update.message.reply_text(_user_friendly_download_error(e, "video"))
             return
 
         # Otherwise ignore
