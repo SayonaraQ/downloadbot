@@ -3998,52 +3998,6 @@ async def sc_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await cq.edit_message_text(f"{label}:", reply_markup=_music_search_keyboard(session_id, page, has_prev, has_more))
 
 
-def _extract_ytmusic_command_payload(text: str) -> str:
-    return re.sub(r"^/ytmusic(?:@\w+)?(?:\s+|$)", "", text.strip(), count=1, flags=re.I).strip()
-
-
-async def ytmusic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Direct top-1 audio download: URL or free text query (no results picker)."""
-    if update.message is None or update.message.text is None:
-        return
-
-    source = _extract_ytmusic_command_payload(update.message.text)
-    if not source:
-        await update.message.reply_text(
-            "Пришли так: `/ytmusic https://youtu.be/...` или `/ytmusic Исполнитель - Название`.\n"
-            "Подойдут ссылки YouTube, SoundCloud, Яндекс.Музыки.",
-            parse_mode="Markdown",
-        )
-        return
-
-    if update.message.chat_id:
-        save_user(update.message.chat_id)
-
-    requester_id = update.effective_user.id if update.effective_user else None
-
-    allowed, retry_after = _check_rate_limit(requester_id, update.message.chat_id)
-    if not allowed:
-        await update.message.reply_text(
-            f"Слишком много запросов. Попробуй через {int(retry_after)} сек."
-        )
-        return
-
-    async with sema:
-        try:
-            entry = await _get_or_download_audio_entry(source, requester_id=requester_id)
-            ad = _build_ad_caption()
-            msg_id = await send_cache_entry(update, context, entry, audio_caption=ad[0] if ad else None)
-            if msg_id and ad:
-                _spawn_bg_task(_remove_caption_after(
-                    context.bot, update.message.chat_id, msg_id, AD_TRACK_DELAY_SEC,
-                ))
-        except ValueError as e:
-            await update.message.reply_text(str(e))
-        except Exception as e:
-            logger.error("Ошибка при загрузке музыки (ytmusic): %s", e)
-            await update.message.reply_text("Не удалось загрузить музыку.")
-
-
 async def handle_cookie_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message is None or update.message.document is None:
         return
@@ -5419,7 +5373,6 @@ async def broadcast_text_input(update: Update, context: ContextTypes.DEFAULT_TYP
 
 BOT_COMMANDS = [
     BotCommand("music",   "Поиск музыки"),
-    BotCommand("ytmusic", "Скачать звук из видео"),
     BotCommand("start",   "Описание бота"),
 ]
 
@@ -5503,7 +5456,6 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(broadcast_callback, pattern=r"^bcast:"))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("music", music_command))
-    app.add_handler(CommandHandler("ytmusic", ytmusic_command))
     app.add_handler(CallbackQueryHandler(music_pick_callback, pattern=r"^mpick:"))
     app.add_handler(CallbackQueryHandler(music_more_callback, pattern=r"^mmore:"))
     app.add_handler(CallbackQueryHandler(music_back_callback, pattern=r"^mback:"))
