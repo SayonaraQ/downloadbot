@@ -3336,6 +3336,44 @@ async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("Heartbeat touch failed: %s", e)
 
 
+async def cleanup_state_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drop stale entries from in-memory dicts. Bounds memory growth on a public bot."""
+    try:
+        now = time.time()
+
+        # Rate-limit logs: prune stale timestamps, drop now-empty buckets.
+        # Run from the asyncio thread; no external lock needed (single event loop writer).
+        cutoff_user = now - RATE_LIMIT_WINDOW_SEC
+        for uid in list(_user_request_log.keys()):
+            bucket = _user_request_log[uid]
+            bucket[:] = [t for t in bucket if t > cutoff_user]
+            if not bucket:
+                _user_request_log.pop(uid, None)
+
+        cutoff_chat = now - RATE_LIMIT_WINDOW_CHAT_SEC
+        for cid in list(_chat_request_log.keys()):
+            bucket = _chat_request_log[cid]
+            bucket[:] = [t for t in bucket if t > cutoff_chat]
+            if not bucket:
+                _chat_request_log.pop(cid, None)
+
+        # Music sessions: delete_task finishes ~MUSIC_SESSION_TTL_SEC after creation
+        # and deletes the Telegram message, but the dict entry stays. Pop it here.
+        for sid in list(_music_search_sessions.keys()):
+            sess = _music_search_sessions[sid]
+            task = sess.get("delete_task")
+            if task is not None and task.done():
+                _music_search_sessions.pop(sid, None)
+
+        # Inline prepare failures: TTL-bound; drop expired.
+        for key in list(_inline_prepare_failures.keys()):
+            info = _inline_prepare_failures.get(key)
+            if not info or info.get("expires_at", 0) < now:
+                _inline_prepare_failures.pop(key, None)
+    except Exception as e:
+        logger.warning("cleanup_state_job failed: %s", e)
+
+
 async def metrics_refresh_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Refresh slow / state-derived gauges. Counters/histograms updated inline."""
     if not _PROM_AVAILABLE:
@@ -5451,6 +5489,12 @@ def build_application() -> Application:
             heartbeat_job,
             interval=HEARTBEAT_INTERVAL_SEC,
             first=1,
+        )
+        # Bound in-memory dicts (rate-limit logs, music sessions, inline failures).
+        app.job_queue.run_repeating(
+            cleanup_state_job,
+            interval=300,
+            first=60,
         )
         # Periodic refresh of Prometheus gauges (cache size, banned count, etc).
         if _PROM_AVAILABLE and METRICS_ENABLED:
