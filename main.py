@@ -772,8 +772,7 @@ def auto_update_ytdlp(force: bool = False) -> None:
         else:
             logger.info("Обновляю yt-dlp: %s → %s", current or "?", latest or "?")
         result = subprocess.run(
-            # `[default]` extra pins curl_cffi to a yt-dlp-compatible version,
-            # which is what enables browser impersonation for IG/TikTok.
+            # `curl-cffi` extra provides browser impersonation targets for IG/TikTok.
             [
                 sys.executable,
                 "-m",
@@ -783,7 +782,7 @@ def auto_update_ytdlp(force: bool = False) -> None:
                 "-U",
                 "--upgrade-strategy",
                 "eager",
-                "yt-dlp[default]",
+                "yt-dlp[default,curl-cffi]",
             ],
             check=False,
             stdout=subprocess.PIPE,
@@ -798,9 +797,9 @@ def auto_update_ytdlp(force: bool = False) -> None:
                 _impersonate_disabled.clear()
                 logger.info("Impersonate снова включён после обновления yt-dlp extras")
         if result.returncode == 0 and "Successfully installed" in out:
-            logger.info("yt-dlp/default dependencies обновлены")
+            logger.info("yt-dlp/default/curl-cffi dependencies обновлены")
         elif result.returncode == 0 and "Requirement already satisfied" in out:
-            logger.info("yt-dlp/default dependencies уже актуальны")
+            logger.info("yt-dlp/default/curl-cffi dependencies уже актуальны")
         else:
             logger.warning("yt-dlp update unclear: rc=%d", result.returncode)
         ffmpeg_path = shutil.which("ffmpeg")

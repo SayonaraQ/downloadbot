@@ -4,6 +4,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir --upgrade "yt-dlp[default]"
+RUN pip install --no-cache-dir --upgrade "yt-dlp[default,curl-cffi]"
 
 WORKDIR /work
