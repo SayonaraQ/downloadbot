@@ -2000,12 +2000,9 @@ def _download_media_with_cookie(
         try:
             download_opts = _build_opts(fmt)
             with YoutubeDL(download_opts) as ydl:
-                if site == "instagram":
-                    ydl.process_ie_result(selected_info, download=True)
-                else:
-                    rc = ydl.download(targets)
-                    if rc:
-                        raise DownloadError(f"yt-dlp завершился с кодом {rc}")
+                rc = ydl.download(targets)
+                if rc:
+                    raise DownloadError(f"yt-dlp завершился с кодом {rc}")
         except DownloadError as e:
             format_errors.append(str(e))
             if fmt_idx < len(formats):
