@@ -167,12 +167,23 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 _DEFAULT_VIDEO_FORMAT = (
-    "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
-    "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-    "best[vcodec^=avc1][ext=mp4]/"
-    "best[vcodec^=avc1]/"
-    "bv*[ext=mp4]+ba[ext=m4a]/"
-    "bv*+ba/best"
+    "bestvideo[height<=720][vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
+    "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
+    "best[height<=720][vcodec^=avc1][acodec!=none][ext=mp4]/"
+    "best[height<=720][vcodec^=avc1][acodec!=none]/"
+    "bv*[height<=720][ext=mp4]+ba[ext=m4a]/"
+    "bv*[height<=720]+ba/"
+    "best[height<=720][vcodec!=none]/"
+    "bestvideo[height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
+    "bestvideo[height<=1080][vcodec!=none]+bestaudio/"
+    "best[height<=1080][vcodec!=none]"
+)
+_LOW_VIDEO_FORMAT_FALLBACK = (
+    "bv*[height<=480][vcodec^=avc1][ext=mp4]+ba[ext=m4a]/"
+    "bv*[height<=480][ext=mp4]+ba[ext=m4a]/"
+    "bv*[height<=480]+ba/"
+    "best[height<=480][vcodec!=none]/"
+    "worst[vcodec!=none]"
 )
 _DEFAULT_INSTAGRAM_VIDEO_FORMAT = f"best[ext=mp4]/{_DEFAULT_VIDEO_FORMAT}"
 
@@ -265,7 +276,7 @@ class Settings(BaseSettings):
     # Video format
     video_format: str = _DEFAULT_VIDEO_FORMAT
     instagram_video_format: str = _DEFAULT_INSTAGRAM_VIDEO_FORMAT
-    video_format_fallback: str = "bestvideo*+bestaudio/best"
+    video_format_fallback: str = _LOW_VIDEO_FORMAT_FALLBACK
     instagram_video_format_fallback: str = ""
     merge_output_format: str = "mp4"
 
@@ -1137,6 +1148,23 @@ def _video_format_fallback_for_site(site: str) -> str:
     return VIDEO_FORMAT_FALLBACK
 
 
+def _video_format_candidates_for_site(site: str) -> list[str]:
+    candidates = [
+        _video_format_for_site(site),
+        _video_format_fallback_for_site(site),
+        _LOW_VIDEO_FORMAT_FALLBACK,
+    ]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for fmt in candidates:
+        fmt = (fmt or "").strip()
+        if fmt and fmt not in seen:
+            out.append(fmt)
+            seen.add(fmt)
+    return out
+
+
 def _proxy_for_video_site(site: str) -> str | None:
     if site == "youtube":
         return YT_PROXY
@@ -1921,8 +1949,11 @@ def _download_media_with_cookie(
         opts["merge_output_format"] = MERGE_OUTPUT_FORMAT
         return opts
 
-    opts = _build_opts(_video_format_for_site(site))
-    with YoutubeDL(opts) as ydl:
+    info_opts = _build_opts(_video_format_for_site(site))
+    info_opts.pop("format", None)
+    info_opts.pop("merge_output_format", None)
+    info_opts.pop("max_filesize", None)
+    with YoutubeDL(info_opts) as ydl:
         info = ydl.extract_info(url, download=False)
 
         # If it's an Instagram story link with explicit id, try to download exactly that story
@@ -1948,26 +1979,57 @@ def _download_media_with_cookie(
         if not targets:
             targets = [url]
 
-        ydl.process_ie_result(selected_info, download=True)
+    selected_files: list[Path] = []
+    dropped_files: list[Path] = []
+    all_files: list[Path] = []
+    format_errors: list[str] = []
+    formats = _video_format_candidates_for_site(site)
 
-    all_files = _collect_downloaded_files(workdir)
-    selected_files, dropped_files = _select_primary_downloads(all_files)
+    for fmt_idx, fmt in enumerate(formats, start=1):
+        if fmt_idx > 1:
+            _cleanup_tmp_dir(workdir)
+        try:
+            download_opts = _build_opts(fmt)
+            with YoutubeDL(download_opts) as ydl:
+                ydl.download(targets)
+        except DownloadError as e:
+            format_errors.append(str(e))
+            if fmt_idx < len(formats):
+                logger.warning(
+                    "[%s] Формат %d/%d не скачался, пробую ниже качество: %s",
+                    site,
+                    fmt_idx,
+                    len(formats),
+                    str(e)[:160],
+                )
+                continue
+            raise
 
-    if not selected_files and any(path.suffix.lower() in AUDIO_EXTENSIONS for path in all_files):
-        logger.warning(
-            "[%s] После скачивания остались только аудиофайлы (%s). Повторяю с fallback format.",
-            site,
-            ", ".join(path.name for path in all_files),
-        )
-        _cleanup_tmp_dir(workdir)
-        fallback_opts = _build_opts(_video_format_fallback_for_site(site))
-        with YoutubeDL(fallback_opts) as ydl:
-            ydl.download(targets)
         all_files = _collect_downloaded_files(workdir)
         selected_files, dropped_files = _select_primary_downloads(all_files)
+        if selected_files:
+            break
+
+        if any(path.suffix.lower() in AUDIO_EXTENSIONS for path in all_files):
+            logger.warning(
+                "[%s] Формат %d/%d дал только аудиофайлы (%s). Пробую ниже качество.",
+                site,
+                fmt_idx,
+                len(formats),
+                ", ".join(path.name for path in all_files),
+            )
+        elif all_files:
+            logger.warning(
+                "[%s] Формат %d/%d не дал видеофайлов (%s). Пробую ниже качество.",
+                site,
+                fmt_idx,
+                len(formats),
+                ", ".join(path.name for path in all_files),
+            )
 
     if not all_files:
-        raise FileNotFoundError("Не удалось найти скачанные файлы после загрузки.")
+        detail = f" Последняя ошибка: {format_errors[-1]}" if format_errors else ""
+        raise FileNotFoundError(f"Не удалось найти скачанные файлы после загрузки.{detail}")
     if not selected_files:
         raise FileNotFoundError("Скачивание завершилось без фото или видео.")
     if dropped_files:
