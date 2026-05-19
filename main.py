@@ -206,7 +206,9 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = 300
     cache_ttl_audio_days: int = 30
     cache_ttl_video_days: int = 7
-    cache_max_size_mb: int = 20000
+    # 20 GB previously, which can fill a shared host (subweb_nl has ~20 GB free).
+    # 5 GB is a saner public-bot default; override in .env when the host has room.
+    cache_max_size_mb: int = 5000
     cache_clean_interval_seconds: int = 60
     inline_prepare_wait_seconds: float = 8.0
 
@@ -530,9 +532,15 @@ def _metrics_set(metric_name: str, value: float, labels: dict[str, str] | None =
 
 
 def _sema_in_use() -> int:
-    # asyncio.Semaphore._value = remaining permits. _value < 0 means waiters queued.
-    val = getattr(sema, "_value", MAX_CONCURRENT_DOWNLOADS)
-    return max(0, MAX_CONCURRENT_DOWNLOADS - int(val))
+    # asyncio.Semaphore._value is the remaining permit count. It's a private
+    # attribute, but it's been stable across CPython 3.8+. If a future Python
+    # version renames or removes it, we silently fall through to 0 rather than
+    # crashing the metrics refresh job.
+    try:
+        val = int(getattr(sema, "_value", MAX_CONCURRENT_DOWNLOADS))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, MAX_CONCURRENT_DOWNLOADS - val)
 
 # Per-user + per-chat rate limiting (sliding windows)
 RATE_LIMIT_PER_USER = max(0, settings.rate_limit_per_user)
