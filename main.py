@@ -1922,8 +1922,8 @@ def _check_duration_limit(info: Any) -> None:
     for entry in _iter_entries(info):
         dur = entry.get("duration")
         if dur and dur > MAX_DURATION_SEC:
-            raise ValueError(
-                f"Видео слишком длинное: {int(dur)} сек. Максимум: {MAX_DURATION_SEC} сек."
+            raise UserFacingDownloadError(
+                f"Видео слишком длинное. Максимальная длительность {MAX_DURATION_SEC // 60} минут."
             )
 
 
@@ -2046,6 +2046,10 @@ def download_media_with_fallback(
             result = _download_media_with_cookie(url, tmp_dir, cookiefile=cookiefile, site=site)
             _remember_successful_cookie(site, cookiefile)
             return result
+        except UserFacingDownloadError:
+            # Deterministic, user-facing failures (duration limit, unsupported
+            # post type) must not be retried across cookies — surface immediately.
+            raise
         except DownloadError as e:
             last_err = e
             last_err_text = str(e)
@@ -2663,8 +2667,8 @@ def _download_audio_with_cookie(
         for entry in entries[:max(1, min(MAX_ITEMS_PER_LINK, 50))]:
             dur = entry.get("duration")
             if dur and dur > MAX_DURATION_SEC:
-                raise ValueError(
-                    f"Трек слишком длинный: {int(dur)} сек. Максимум: {MAX_DURATION_SEC} сек."
+                raise UserFacingDownloadError(
+                    f"Трек слишком длинный. Максимальная длительность {MAX_DURATION_SEC // 60} минут."
                 )
         processed_info = ydl.process_ie_result(info, download=True)
         if isinstance(processed_info, dict):
