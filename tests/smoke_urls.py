@@ -7,7 +7,7 @@ VIDEO_URLS = {
     "youtube_shorts":  "https://youtube.com/shorts/szIUME5cZ1s",
     "instagram_reel":  "https://www.instagram.com/reel/DYenCpWiptc/",
     "tiktok":          "https://vt.tiktok.com/ZSx6QVxVu/",
-    "vk_video":        "https://vkvideo.ru/clip-211948874_456240163",
+    "vk_video":        "https://vkvideo.ru/clip-29995722_456248872",
 }
 
 MUSIC_QUERY = "Сплин - Выхода нет"
