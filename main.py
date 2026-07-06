@@ -189,6 +189,9 @@ class Settings(BaseSettings):
     token: str = Field(default="", validation_alias=AliasChoices("TOKEN", "BOT_TOKEN"))
     admin_id: int = 0
     inline_cache_chat_id: int = 0
+    # HTTP CONNECT proxy for Telegram Bot API traffic only (yt-dlp downloads go
+    # direct). Workaround for lossy provider peering towards Telegram AS.
+    telegram_proxy_url: str = ""
 
     # Storage paths
     data_dir: str = "data"
@@ -316,6 +319,7 @@ def _nz(s: str | None) -> str | None:
 TOKEN = settings.token or None
 ADMIN_ID = settings.admin_id
 INLINE_CACHE_CHAT_ID = settings.inline_cache_chat_id
+TELEGRAM_PROXY_URL = settings.telegram_proxy_url.strip()
 
 DATA_DIR = Path(settings.data_dir)
 USERS_FILE = DATA_DIR / "users.txt"  # legacy plain-text store, kept for migration
@@ -5451,15 +5455,23 @@ def build_application() -> Application:
     defaults = Defaults(
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
-    app = (
+    builder = (
         ApplicationBuilder()
         .token(TOKEN)
         .defaults(defaults)
+        .connect_timeout(10.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .media_write_timeout(120.0)
+        .pool_timeout(10.0)
         .post_init(_set_bot_metadata)
         .post_stop(_post_stop)
         .concurrent_updates(True)
-        .build()
     )
+    if TELEGRAM_PROXY_URL:
+        builder = builder.proxy(TELEGRAM_PROXY_URL)
+        logger.info("Telegram Bot API через proxy: %s", TELEGRAM_PROXY_URL)
+    app = builder.build()
 
     # Ban gate runs before everything else: dropped updates never reach handlers.
     app.add_handler(TypeHandler(Update, ban_gate_handler), group=-2)
