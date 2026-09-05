@@ -166,11 +166,17 @@ from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+# Prefer an H.264 rendition so _normalize_video_for_ios can `-c:v copy`
+# instead of re-encoding. Match both spellings of the codec: YouTube reports
+# "avc1.640028", TikTok reports plain "h264" — a bare ^=avc1 silently misses
+# TikTok and drops us into the bv*+ba tail, which picks its 1080p H.265
+# ladder and forces a transcode. Sources with no H.264 at all still fall
+# through to that tail and get normalized.
 _DEFAULT_VIDEO_FORMAT = (
-    "bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[acodec^=mp4a][ext=m4a]/"
-    "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/"
-    "best[vcodec^=avc1][ext=mp4]/"
-    "best[vcodec^=avc1]/"
+    "bestvideo[vcodec~='^(avc1|h264)'][ext=mp4]+bestaudio[acodec~='^(mp4a|aac)'][ext=m4a]/"
+    "bestvideo[vcodec~='^(avc1|h264)']+bestaudio[acodec~='^(mp4a|aac)']/"
+    "best[vcodec~='^(avc1|h264)'][ext=mp4]/"
+    "best[vcodec~='^(avc1|h264)']/"
     "bv*[ext=mp4]+ba[ext=m4a]/"
     "bv*+ba/best"
 )
