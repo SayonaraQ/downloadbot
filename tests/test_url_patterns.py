@@ -21,25 +21,27 @@ from pathlib import Path
 
 MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
 PATTERNS = ("TIKTOK_RE", "SUPPORTED_VIDEO_URL_RE")
+FUNCTIONS = ("_url_host",)
 
 
-def _patterns_from_main() -> dict[str, re.Pattern]:
-    """Compile the URL regexes out of main.py without importing it.
+def _names_from_main() -> dict:
+    """Compile the URL regexes and helpers out of main.py without importing it.
 
     Importing main.py pulls in Settings/.env and the Telegram stack; the
-    patterns are plain re.compile() calls, so evaluate just those.
+    patterns are plain re.compile() calls and the helpers are self-contained,
+    so evaluate just those.
     """
     tree = ast.parse(MAIN_PY.read_text(encoding="utf-8"))
     ns: dict = {"re": re}
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
             isinstance(t, ast.Name) and t.id in PATTERNS for t in node.targets
-        ):
+        ) or isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS:
             exec(compile(ast.Module([node], []), str(MAIN_PY), "exec"), ns)
-    missing = [p for p in PATTERNS if p not in ns]
+    missing = [p for p in PATTERNS + FUNCTIONS if p not in ns]
     if missing:
         raise AssertionError(f"not found in main.py: {', '.join(missing)}")
-    return {p: ns[p] for p in PATTERNS}
+    return ns
 
 
 # (url, expected match) — direct messages use TIKTOK_RE.match on the whole
@@ -54,16 +56,31 @@ CASES = [
 ]
 
 
+# (text, expected host) — _url_host feeds the log line for unsupported links,
+# so it must never carry userinfo (user:password@) or the path.
+HOST_CASES = [
+    ("https://user:secret@vm.example.com:8443/path?q=1", "vm.example.com"),
+    ("смотри https://Lite.TikTok.com/t/abc/", "lite.tiktok.com"),
+    ("просто текст", None),
+]
+
+
 def main() -> int:
-    patterns = _patterns_from_main()
+    patterns = _names_from_main()
     failed = 0
+    for text, want in HOST_CASES:
+        got = patterns["_url_host"](text)
+        ok = got == want
+        print(f"{'ok  ' if ok else 'FAIL'} host={got!r} want={want!r} {text}")
+        failed += not ok
     for url, want in CASES:
         got_direct = bool(patterns["TIKTOK_RE"].match(url))
         got_inline = bool(patterns["SUPPORTED_VIDEO_URL_RE"].search(url))
         ok = got_direct == want and got_inline == want
         print(f"{'ok  ' if ok else 'FAIL'} direct={got_direct!s:5} inline={got_inline!s:5} want={want!s:5} {url}")
         failed += not ok
-    print(f"\n{len(CASES) - failed}/{len(CASES)} passed")
+    total = len(CASES) + len(HOST_CASES)
+    print(f"\n{total - failed}/{total} passed")
     return 1 if failed else 0
 
 

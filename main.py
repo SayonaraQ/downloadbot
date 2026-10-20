@@ -2421,7 +2421,8 @@ def _url_host(text: str) -> str | None:
     if not match:
         return None
     try:
-        return urlsplit(match.group(0)).netloc or None
+        # hostname, not netloc: netloc carries user:password@ if the link has it
+        return urlsplit(match.group(0)).hostname or None
     except ValueError:
         return None
 
