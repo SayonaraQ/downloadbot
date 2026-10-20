@@ -726,12 +726,12 @@ def _session_page(session: dict[str, Any]) -> tuple[list[dict[str, Any]], bool, 
 # URL patterns (keep strict behaviour: react only to supported domains)
 # -------------------------
 INSTAGRAM_RE = re.compile(r"^\s*https?://(?:(?:www|m)\.)?instagram\.com/\S+\s*$", re.I)
-TIKTOK_RE = re.compile(r"^\s*(?:https?://(?:(?:www)\.)?tiktok\.com/\S+|https?://vt\.tiktok\.com/\S+)\s*$", re.I)
+TIKTOK_RE = re.compile(r"^\s*(?:https?://(?:(?:www)\.)?tiktok\.com/\S+|https?://(?:vm|vt)\.tiktok\.com/\S+)\s*$", re.I)
 YOUTUBE_RE = re.compile(r"^\s*(?:https?://(?:(?:www|m)\.)?youtube\.com/\S+|https?://youtu\.be/\S+)\s*$", re.I)
 VK_RE = re.compile(r"^\s*(?:https?://(?:(?:www)\.)?vk\.com/\S+|https?://vk\.cc/\S+|https?://vkvideo\.ru/\S+)\s*$", re.I)
 SOUNDCLOUD_RE = re.compile(r"^\s*(?:https?://(?:(?:www|m)\.)?soundcloud\.com/\S+|https?://on\.soundcloud\.com/\S+)\s*$", re.I)
 SUPPORTED_VIDEO_URL_RE = re.compile(
-    r"https?://(?:(?:(?:www|m)\.)?instagram\.com|(?:(?:www)\.)?tiktok\.com|vt\.tiktok\.com|(?:(?:www|m)\.)?youtube\.com|youtu\.be|(?:(?:www)\.)?vk\.com|vk\.cc|vkvideo\.ru)/\S+",
+    r"https?://(?:(?:(?:www|m)\.)?instagram\.com|(?:(?:www)\.)?tiktok\.com|(?:vm|vt)\.tiktok\.com|(?:(?:www|m)\.)?youtube\.com|youtu\.be|(?:(?:www)\.)?vk\.com|vk\.cc|vkvideo\.ru)/\S+",
     re.I,
 )
 
@@ -2412,6 +2412,18 @@ def _extract_audio_url(text: str) -> str | None:
 
 def _looks_like_url(text: str) -> bool:
     return bool(re.match(r"^\s*https?://", text, re.I))
+
+
+def _url_host(text: str) -> str | None:
+    """Host of the first http(s) link in text — to log links we don't support."""
+    from urllib.parse import urlsplit
+    match = re.search(r"https?://\S+", text, re.I)
+    if not match:
+        return None
+    try:
+        return urlsplit(match.group(0)).netloc or None
+    except ValueError:
+        return None
 
 
 def _audio_site_for_url(url: str) -> str:
@@ -4773,6 +4785,9 @@ async def handle_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         if not video_url:
+            host = _url_host(text)
+            if host:
+                logger.info("inline: ссылка не поддерживается (%s)", host)
             await inline_query.answer(
                 [_inline_article("Ссылка не найдена", "Укажи ссылку на Instagram, TikTok, YouTube, VK, SoundCloud или Яндекс.Музыку — или Исполнитель - Название для поиска музыки.")],
                 cache_time=1,
@@ -5014,6 +5029,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         # Otherwise ignore
+        host = _url_host(text)
+        if host:
+            logger.info("Ссылка не поддерживается, игнорирую (%s)", host)
         return
 
 
